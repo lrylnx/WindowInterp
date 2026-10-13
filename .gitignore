@@ -1,0 +1,32 @@
+# 构建产物
+窗口插帧助手.app/
+dist/
+
+# 签名材料（私钥不能进仓库）
+signing/
+
+# 自检产出
+dump/
+*.log
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# dev 工具：这些是可执行文件，用同名 .swift 现场重建
+#   xcrun swiftc -O dev/<name>.swift -o dev/<name>
+dev/clickreceiver
+dev/clicktest
+dev/displays
+dev/gpu-energy
+dev/keytest
+dev/latency-probe
+dev/probe-frames
+dev/testpattern
+
+# 临时现场（备份 / 复现用的日志）
+dev/backups-*/
+dev/verification-*/
+
+# 本机验证截图现场（部分含个人工作画面，不进仓库）
+validation/
