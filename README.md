@@ -11,6 +11,8 @@
 技术来自 LSFG 视频播放器（同一个引擎、同一条 Metal 渲染管线），但取景方式完全不同 ——
 抓的是**窗口**，看的也是**另一个窗口**。
 
+**下载**：[最新版本](https://github.com/lrylnx/WindowInterp/releases/latest)　·　解压即用，Apple Silicon / macOS 15+
+
 ## 效果
 
 ### 插帧运行中：覆盖层精确贴住源窗口，角标实时显示「源 X → 估计 Y fps」
