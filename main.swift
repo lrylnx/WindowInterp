@@ -24,7 +24,7 @@ import Carbon.HIToolbox   // 系统级全局热键（RegisterEventHotKey）
 
 /// 版本标识 —— 「功能不好使」排查第一步永远是问版本（红线），所以把它打进
 /// 启动日志和菜单栏菜单头部，谁都能报出自己跑的是哪一版。
-let appVersion = "1.1.1-rec1"
+let appVersion = "1.1.2-perf1"
 
 // MARK: - 引擎注入（与 LSFG 视频播放器同一套路）
 
@@ -284,6 +284,11 @@ if hasFlag("--auto-dry-run") {
 // 分辨率**平方**增长，所以 flow scale（光流的工作分辨率缩放）是仅次于分辨率的
 // 省电开关：1.0 = 满分辨率（最贵），0.5 / 0.25 能省掉成倍算力，而视频上肉眼
 // 差别很小（文字/细密纹理场景才看得出来）。
+//
+// 另一个省电开关是 `performance_mode`（= 小黄鸭 LSFG 3.1 的 Performance mode，
+// 官方口径「GPU 负载最多减半」）：引擎换一套轻量着色器，画质略有让步。
+// 实测本工具 3× 插帧下 GPU 功耗 3.40 W → 0.99 W，**生成帧数一张不少**
+// （输出被 vblank 限住，省下的是纯算力）⇒ 笔记本上很值。默认关，界面上可勾。
 let flowScale = argument("--flow-scale") ?? preferences.string(forKey: "flowScale") ?? "1.0"
 let performanceMode = hasFlag("--performance") || preferences.bool(forKey: "performanceMode")
 // 目标帧率默认 = 屏幕刷新率：生成帧超过这个数屏幕上根本显示不出来，算了也白算。
@@ -1347,6 +1352,8 @@ final class FirstMouseButton: NSButton {
     var resolutionPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     var flowPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     var reconstructPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    /// 「性能模式（轻量着色器）」复选框。菜单栏也要能改它，所以留成属性好同步状态。
+    var perfModeCheck = NSButton(checkboxWithTitle: "", target: nil, action: nil)
 
     // 输出 HUD
     var hud: NSView!
@@ -1695,6 +1702,16 @@ final class FirstMouseButton: NSButton {
         reconstructPopup.selectItem(at: ReconstructMode.allCases.firstIndex(of: reconstruct) ?? 0)
         reconstructPopup.target = self; reconstructPopup.action = #selector(reconstructChanged)
 
+        // 性能模式（轻量着色器）= 引擎的 `performance_mode`（环境变量 `LSFGM_PERFORMANCE_MODE`）。
+        // 和小黄鸭 LSFG 3.1 那个 Performance mode 是同一个东西：引擎换一套更便宜的着色器。
+        // 实测（源 1920×1080 / 3× / 光流 1.0）：GPU 功耗 3.40 W → 0.99 W，而**生成帧数一模一样**
+        // （source=480 时两边都是 generated=958 —— 输出被 vblank 限住，省下的是纯算力）。
+        // 代价是画质略有让步（引擎侧语义），所以默认关、由用户自己权衡。
+        // 与「光流精度」同类：都是**进程启动那一刻**注入的环境变量 ⇒ 改了必须重启进程。
+        perfModeCheck = NSButton(checkboxWithTitle: "性能模式（轻量着色器）· GPU 功耗约降到 1/3，帧数不变，画质略有代价",
+                                 target: self, action: #selector(perfModeChanged(_:)))
+        perfModeCheck.state = performanceMode ? .on : .off
+
         startButton = NSButton(title: running ? "停止插帧" : "开始插帧", target: self, action: #selector(startStopClicked))
         startButton.bezelStyle = .rounded
         startButton.keyEquivalent = "\r"
@@ -1721,7 +1738,7 @@ final class FirstMouseButton: NSButton {
         let perfRow = NSStackView(views: [resolutionPopup, flowPopup, reconstructPopup])
         perfRow.spacing = 8
 
-        let stack = NSStackView(views: [title, steps, topRow, perfRow, tableScroll, hintLabel, autoCheck, flipCheck, badgeCheck, bottomRow, statusLabel])
+        let stack = NSStackView(views: [title, steps, topRow, perfRow, perfModeCheck, tableScroll, hintLabel, autoCheck, flipCheck, badgeCheck, bottomRow, statusLabel])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
@@ -1876,6 +1893,18 @@ final class FirstMouseButton: NSButton {
         preferences.set(Self.flowScaleOptions[idx].value, forKey: "flowScale")
         hintLabel.stringValue = "光流精度改成 \(Self.flowScaleOptions[idx].value)，正在重启以生效…"
         // 光流精度是引擎的环境变量，只能在进程启动那一刻注入
+        relaunch(multiplier: multiplier, autostart: running, seekTarget: selected?.windowID)
+    }
+
+    /// 性能模式（轻量着色器）。与「光流精度」同一条路：写偏好 + 重启进程才生效。
+    /// ⚠️ 绝不能把新值当命令行参数转发（见 `relaunch()` 里那段注释）—— 命令行优先级比
+    /// UserDefaults 高，转发旧值会把用户刚勾的选项按回去。唯一真相永远是 UserDefaults。
+    @objc func perfModeChanged(_ sender: NSButton) {
+        let on = sender.state == .on
+        preferences.set(on, forKey: "performanceMode")
+        hintLabel.stringValue = on
+            ? "性能模式已开：引擎换轻量着色器（实测 GPU 功耗降到约 1/3、帧数不变），正在重启以生效…"
+            : "性能模式已关：回到画质优先的着色器，正在重启以生效…"
         relaunch(multiplier: multiplier, autostart: running, seekTarget: selected?.windowID)
     }
 
@@ -3010,6 +3039,8 @@ final class FirstMouseButton: NSButton {
             bits.append("原帧模式")
         } else {
             bits.append("光流 \(flowScale)")
+            // 性能模式是「省电换画质」那一类，跟光流精度并列写出来，否则用户看不出它开着
+            if performanceMode { bits.append("性能模式") }
             let fps = Int(effectiveCaptureFPS)
             bits.append("采集 ≤\(fps)fps")
             bits.append("\(multiplier)× → \(fps * multiplier)fps")
@@ -3040,6 +3071,16 @@ final class FirstMouseButton: NSButton {
         guard let v = sender.representedObject as? String else { return }
         preferences.set(v, forKey: "flowScale")
         // 光流精度是引擎的环境变量，只能在进程启动那一刻注入 ⇒ 必须重启进程
+        relaunch(multiplier: multiplier, autostart: running, seekTarget: selected?.windowID)
+    }
+
+    /// 菜单栏切「性能模式（轻量着色器）」。引擎环境变量 ⇒ 必须重启进程。
+    @objc func togglePerfMode() {
+        let on = !performanceMode
+        preferences.set(on, forKey: "performanceMode")
+        perfModeCheck.state = on ? .on : .off
+        statusLabel.stringValue = on ? "性能模式已开（轻量着色器）：正在重启以生效…"
+                                     : "性能模式已关：正在重启以生效…"
         relaunch(multiplier: multiplier, autostart: running, seekTarget: selected?.windowID)
     }
 
@@ -3233,6 +3274,14 @@ final class FirstMouseButton: NSButton {
         let flowItem = NSMenuItem(title: "光流精度（最影响功耗）", action: nil, keyEquivalent: "")
         flowItem.submenu = flowMenu
         menu.addItem(flowItem)
+
+        // 性能模式（轻量着色器）= 引擎 `performance_mode`，小黄鸭 LSFG 3.1 的同名功能。
+        // 它是**引擎环境变量**（改了要重启进程），所以不做成子菜单，直接一项勾选。
+        let perfModeItem = NSMenuItem(title: "性能模式（轻量着色器 · 省电约 2/3）",
+                                      action: #selector(togglePerfMode), keyEquivalent: "")
+        perfModeItem.target = self
+        perfModeItem.state = performanceMode ? .on : .off
+        menu.addItem(perfModeItem)
 
         // 输出重建档（「档 1」）。放在功耗两项之后，因为它也是「画质 vs 开销」那一类。
         let recMenu = NSMenu()
