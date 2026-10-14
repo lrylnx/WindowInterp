@@ -24,7 +24,7 @@ import Carbon.HIToolbox   // 系统级全局热键（RegisterEventHotKey）
 
 /// 版本标识 —— 「功能不好使」排查第一步永远是问版本（红线），所以把它打进
 /// 启动日志和菜单栏菜单头部，谁都能报出自己跑的是哪一版。
-let appVersion = "1.1.2-perf1"
+let appVersion = "1.1.3-hud"
 
 // MARK: - 引擎注入（与 LSFG 视频播放器同一套路）
 
@@ -1361,6 +1361,11 @@ final class FirstMouseButton: NSButton {
     var badge: NSView!
     var badgeLabel = NSTextField(labelWithString: "")
     var hudTimer: Timer?
+    var mouseActivityTimer: Timer?
+    var lastMousePosition = NSEvent.mouseLocation
+    var floatingControlsVisible = true
+    var metalHUDEnabled = preferences.bool(forKey: "metalHUDEnabled")
+    var metalHUDCheck = NSButton(checkboxWithTitle: "Metal HUD（帧率 / GPU 性能）", target: nil, action: nil)
     var pauseButton: FirstMouseButton!
     var stopButton: FirstMouseButton!
 
@@ -1638,7 +1643,7 @@ final class FirstMouseButton: NSButton {
     // MARK: 控制窗
 
     func buildControlWindow() {
-        controlWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 560),
+        controlWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 590),
                                  styleMask: [.titled, .closable, .miniaturizable, .resizable],
                                  backing: .buffered, defer: false)
         controlWindow.title = "窗口插帧助手 \(offMode ? "· 原帧模式" : "· LSFG \(multiplier)×")"
@@ -1719,8 +1724,11 @@ final class FirstMouseButton: NSButton {
 
         let flipCheck = NSButton(checkboxWithTitle: "画面上下颠倒（只在显示不正常时才勾）", target: self, action: #selector(flipChanged))
         flipCheck.state = invertVertical ? .on : .off
-        let badgeCheck = NSButton(checkboxWithTitle: "输出窗口显示常驻角标", target: self, action: #selector(badgeChanged))
+        let badgeCheck = NSButton(checkboxWithTitle: "显示右上角插帧角标（鼠标静止 3 秒后隐藏）", target: self, action: #selector(badgeChanged))
         badgeCheck.state = showBadge ? .on : .off
+        metalHUDCheck.target = self
+        metalHUDCheck.action = #selector(toggleMetalHUD)
+        metalHUDCheck.state = metalHUDEnabled ? .on : .off
         // 输出方式只有一个（贴住源窗口的穿透覆盖层），所以这里没有「游戏模式」开关可勾了。
         // 自动倍率：按源窗口真实帧率选最合适的倍率（先量再定，实测不达标就降档）
         let autoCheck = NSButton(checkboxWithTitle: "自动倍率：按窗口帧率选最合适的倍率（优先帧率/丝滑，效果不好自动降档）", target: self, action: #selector(autoMultiplierChanged(_:)))
@@ -1738,7 +1746,7 @@ final class FirstMouseButton: NSButton {
         let perfRow = NSStackView(views: [resolutionPopup, flowPopup, reconstructPopup])
         perfRow.spacing = 8
 
-        let stack = NSStackView(views: [title, steps, topRow, perfRow, perfModeCheck, tableScroll, hintLabel, autoCheck, flipCheck, badgeCheck, bottomRow, statusLabel])
+        let stack = NSStackView(views: [title, steps, topRow, perfRow, perfModeCheck, tableScroll, hintLabel, autoCheck, flipCheck, badgeCheck, metalHUDCheck, bottomRow, statusLabel])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
@@ -1838,7 +1846,7 @@ final class FirstMouseButton: NSButton {
         }
     }
     @objc func flipChanged(_ sender: NSButton) { invertVertical.toggle(); preferences.set(invertVertical, forKey: "invertVertical"); hintLabel.stringValue = "画面方向已改，重新开始插帧后生效（正在播放的画面不会立刻变）" }
-    @objc func badgeChanged(_ sender: NSButton) { showBadge.toggle(); preferences.set(showBadge, forKey: "showBadge"); badge?.isHidden = !showBadge }
+    @objc func badgeChanged(_ sender: NSButton) { showBadge.toggle(); preferences.set(showBadge, forKey: "showBadge"); badge?.isHidden = !showBadge || !floatingControlsVisible; if showBadge { flashHUD() } }
 
     @objc func multiplierChanged() {
         let idx = multiplierPopup.indexOfSelectedItem
@@ -2198,6 +2206,10 @@ final class FirstMouseButton: NSButton {
         }
         overlayWindowID = 0
         overlaySpaces = []
+        mouseActivityTimer?.invalidate()
+        mouseActivityTimer = nil
+        hudTimer?.invalidate()
+        hudTimer = nil
         gameHUD?.orderOut(nil)
         gameHUD = nil
         if let w = interpWindow {
@@ -2229,6 +2241,7 @@ final class FirstMouseButton: NSButton {
 
             video = VideoView(frame: .zero)
             metal = CAMetalLayer()
+            applyMetalHUD()
             metal.device = device
             metal.pixelFormat = .bgra8Unorm
             metal.framebufferOnly = false
@@ -2270,7 +2283,7 @@ final class FirstMouseButton: NSButton {
         metal.drawableSize = captureSize
         metal.contentsScale = interpWindow.backingScaleFactor
         video.needsLayout = true
-        if showBadge { flashHUD() }
+        startMouseActivityTracking()
 
         // 输出方式：**贴住源窗口的穿透覆盖层**（唯一方式）—— 一个无边框窗口，
         // 精确盖在源窗口上（不是铺满整屏）。
@@ -2580,12 +2593,54 @@ final class FirstMouseButton: NSButton {
         flashHUD()
     }
 
+    func applyMetalHUD() {
+        // Apple 的公开 CAMetalLayer API；Info.plist 开启能力，mode 控制实时显示。
+        metal?.developerHUDProperties = metalHUDEnabled ? ["mode": "default"] : [:]
+    }
+
+    @objc func toggleMetalHUD() {
+        metalHUDEnabled.toggle()
+        preferences.set(metalHUDEnabled, forKey: "metalHUDEnabled")
+        metalHUDCheck.state = metalHUDEnabled ? .on : .off
+        applyMetalHUD()
+        rebuildStatusMenu()
+    }
+
+    func setFloatingControlsVisible(_ visible: Bool) {
+        floatingControlsVisible = visible
+        hud?.alphaValue = visible ? 1 : 0
+        badge?.isHidden = !visible || !showBadge
+        badge?.alphaValue = visible ? 1 : 0
+        // 隐藏面板同时撤掉命中区域，避免看不见的按钮挡住源窗口。
+        if visible { gameHUD?.orderFrontRegardless() }
+        else { gameHUD?.orderOut(nil) }
+    }
+
+    func startMouseActivityTracking() {
+        mouseActivityTimer?.invalidate()
+        lastMousePosition = NSEvent.mouseLocation
+        flashHUD()
+        // 只读系统鼠标位置，无需辅助功能权限，也不修改源 App 的光标。
+        let timer = Timer(timeInterval: 0.15, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let point = NSEvent.mouseLocation
+                guard point != self.lastMousePosition else { return }
+                self.lastMousePosition = point
+                if self.interpWindow?.frame.contains(point) == true || self.gameHUD?.frame.contains(point) == true {
+                    self.flashHUD()
+                }
+            }
+        }
+        mouseActivityTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
     func flashHUD() {
-        guard let hud else { return }
-        hud.alphaValue = 1
+        setFloatingControlsVisible(true)
         hudTimer?.invalidate()
         hudTimer = Timer(timeInterval: 3.0, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated { NSAnimationContext.runAnimationGroup { ctx in ctx.duration = 0.4; self?.hud.animator().alphaValue = 0 } }
+            MainActor.assumeIsolated { self?.setFloatingControlsVisible(false) }
         }
         RunLoop.main.add(hudTimer!, forMode: .common)
     }
@@ -2695,7 +2750,7 @@ final class FirstMouseButton: NSButton {
             gameHUD = panel
         }
         positionGameHUD(overlayFrame: overlayFrame)
-        gameHUD?.orderFrontRegardless()
+        flashHUD()
         logLine("game-hud: 已显示 frame=\(gameHUD?.frame ?? .zero)")
     }
 
@@ -3301,7 +3356,12 @@ final class FirstMouseButton: NSButton {
         fpsItem.state = autoMatchFPS ? .on : .off
         menu.addItem(fpsItem)
 
-        let badgeItem = NSMenuItem(title: "显示常驻角标", action: #selector(toggleBadge), keyEquivalent: "")
+        let metalItem = NSMenuItem(title: "Metal HUD（帧率 / GPU 性能）", action: #selector(toggleMetalHUD), keyEquivalent: "")
+        metalItem.target = self
+        metalItem.state = metalHUDEnabled ? .on : .off
+        menu.addItem(metalItem)
+
+        let badgeItem = NSMenuItem(title: "显示插帧角标（自动隐藏）", action: #selector(toggleBadge), keyEquivalent: "")
         badgeItem.target = self
         badgeItem.state = showBadge ? .on : .off
         menu.addItem(badgeItem)
@@ -3335,7 +3395,7 @@ final class FirstMouseButton: NSButton {
         NSApplication.shared.activate(ignoringOtherApps: true)
         w.makeKeyAndOrderFront(nil)
     }
-    @objc func toggleBadge() { showBadge.toggle(); preferences.set(showBadge, forKey: "showBadge"); badge?.isHidden = !showBadge }
+    @objc func toggleBadge() { showBadge.toggle(); preferences.set(showBadge, forKey: "showBadge"); badge?.isHidden = !showBadge || !floatingControlsVisible; if showBadge { flashHUD() } }
     @objc func toggleFlip() { invertVertical.toggle(); preferences.set(invertVertical, forKey: "invertVertical"); statusLabel.stringValue = "画面方向已改，重新开始插帧后生效（当前播放不会变）" }
 
     @objc func menuMultiplier(_ sender: NSMenuItem) {
