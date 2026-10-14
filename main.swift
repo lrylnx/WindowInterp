@@ -24,7 +24,7 @@ import Carbon.HIToolbox   // 系统级全局热键（RegisterEventHotKey）
 
 /// 版本标识 —— 「功能不好使」排查第一步永远是问版本（红线），所以把它打进
 /// 启动日志和菜单栏菜单头部，谁都能报出自己跑的是哪一版。
-let appVersion = "1.1.3-hud"
+let appVersion = "1.2.0"
 
 // MARK: - 引擎注入（与 LSFG 视频播放器同一套路）
 
@@ -82,201 +82,7 @@ if let raw = rawMultiplier, Int(raw) == nil {
 let askedMultiplier = Int(rawMultiplier ?? "") ?? (supportedMultipliers.contains(savedMultiplier) ? savedMultiplier : 2)
 let manualMultiplier = supportedMultipliers.contains(askedMultiplier) ? askedMultiplier : 2
 
-// MARK: - 自动倍率（按窗口帧率自适应）
-//
-// 为什么需要它：实测（2026-10-12 第十轮普查 → dev/优化空间普查-2026-10-12.md）
-// 把「插帧顺不顺」拆成三个互相拉扯的量 ——
-//   ① **输出帧率要贴住屏幕刷新率 R**（越接近越顺，超出 R 的部分根本显示不出来）；
-//   ② 输出帧率与 R 还要**成整数比**：引擎自报的 `display intervals ... late=` 就是
-//      「晚一个刷新周期」的帧数占比，实测同一个源上 2× = 26%、3× = 3.8%、5× = 0.4%，
-//      规律是 late ≈ |R/out − round(R/out)| —— **可以提前算出来，不用先跑再骂**；
-//   ③ 但倍率越高，采集上限（R÷倍率）越低 ⇒ 源帧被砍得越狠（信息损失），
-//      端到端延迟也线性增长（高刷屏上 =(倍率+1) 个刷新周期）。
-// 于是「最合适的倍率」随源帧率变化：60fps 游戏、40fps 视频、24fps 视频各不相同，
-// 用户举例「24fps 视频肉眼可见原片更流畅、插帧更卡」多半就是固定倍率撞上了 ②/③。
-// 手选一个固定倍率不可能一直对，所以做两段式自动：
-//   ① **探测**：先用 2× 跑一小段量出源窗口真实帧率 S（2× 的采集上限 = R/2，够放行
-//      绝大多数源）；S 太小（静止画面/暂停）就判不了 —— 保持 2×，等它动起来再探。
-//   ② **规划**：对每个候选倍率算「输出帧率 / 节奏抖动 / 源信息损失 / 延迟」，按
-//      「帧率完成度优先」打分，得到一条从高到低的候选阶梯，然后从阶梯头开跑。
-//   ③ **验证**：实测跑一段，用引擎自己的遥测判定达标与否（输出没到预期 / 节奏抖动
-//      超标 / 掉帧 / 插值网络跑不赢）—— 不达标就往下降一档。这就是「最高帧率效果
-//      不好就降档」。全部判据取实测，不做主观猜测。
-//
-// ⚠️ 倍率是引擎的**进程级环境变量**，改它只能重启进程 ⇒ 每一档 = 一次 relaunch，
-// 状态（阶梯、走到第几档、重规划次数）通过 `--auto-*` 参数沿重启链传递。
-// ⚠️ 探测/验证都必须有「功能真的在跑」的独立证据：样本只在引擎写出新的
-// `Frame generation stats` 时才采，采不到就判不了（而不是当成「很好」）。
-enum AutoMultiplierPlanner {
-    /// 引擎采集侧的硬下限，必须与 `effectiveCaptureFPS` 里的 `max(24, …)` 一致。
-    static let minCaptureFPS = 24.0
-    /// 每源帧生成 4 张以上开始扣分（插值质量与算力代价的经验拐点）。
-    static let genSoftCap = 4
-
-    /// 引擎在某一档倍率下的采集上限（与 CapturePipeline 用的式子同源）。
-    static func captureCap(_ m: Int, refresh R: Double) -> Double {
-        max(minCaptureFPS, (R / Double(m)).rounded())
-    }
-
-    struct Candidate {
-        let multiplier: Int
-        let captureCap: Double
-        let sourceEffective: Double
-        let outputFPS: Double
-        let paceJitter: Double
-        let starvation: Double
-        let latencyMS: Double
-        let score: Double
-
-        var summary: String {
-            String(format: "%2d×  采集≤%3.0f  源%3.0f  出%5.1f  抖动%4.1f%%  源损失%4.1f%%  延迟%5.1fms  评分%6.1f",
-                   multiplier, captureCap, sourceEffective, outputFPS,
-                   paceJitter * 100, starvation * 100, latencyMS, score)
-        }
-    }
-
-    static func evaluate(multiplier m: Int, sourceFPS s: Double, refresh R: Double) -> Candidate {
-        let cap = captureCap(m, refresh: R)
-        let sEff = min(s, cap)                       // 源多出来的部分被采集上限砍掉
-        let out = min(sEff * Double(m), R)           // 引擎输出上限 = 屏幕刷新率
-        let ratio = out > 1 ? R / out : 0
-        let pace = abs(ratio - ratio.rounded())      // ≈ late 占比（实测线性吻合）
-        let starve = s > 0 ? max(0, s - R / Double(m)) / s : 0
-        let latency = Double(m + 1) * 1000 / max(R, 1)
-        var score = 100 * (out / R)                  // 帧率完成度：权重最大（用户要丝滑）
-        score -= 45 * pace                           // 节奏抖动
-        score -= 25 * starve                         // 源信息损失
-        score -= 15 * min(1, max(0, (latency - 20) / 60))   // 延迟（20ms 起罚，80ms 罚满）
-        score -= 6 * Double(max(0, m - genSoftCap))  // 生成负担
-        return Candidate(multiplier: m, captureCap: cap, sourceEffective: sEff,
-                         outputFPS: out, paceJitter: pace, starvation: starve,
-                         latencyMS: latency, score: score)
-    }
-
-    /// 候选阶梯：**第一个 = 首选档**（会先试它），后面按「降档」顺序排。
-    ///
-    /// ⚠️ 后面那一段**只收倍率更低的档**，并按倍率从高到低 —— 语义是「效果不好就往下退」。
-    /// 踩过的坑：一开始直接按评分排，60fps 的评分序是 [3,4,5,2,6,8,10,12]，
-    /// 于是从 2× 再往「下一档」就跳到 6×/8×/10× —— 那是**升档**，越降越激进，
-    /// 实测一路爬到 8×（采集被钳到 24fps、输出 192fps 全是废帧）才卡住。
-    /// 降档必须单调递减，否则这个功能会自己把事情搞坏。
-    ///
-    /// 顺手剔除「输出必然超出刷新率」的档位（那些帧算了也显示不出来，纯浪费）。
-    static func ladder(sourceFPS s: Double, refresh R: Double) -> [Candidate] {
-        // 源帧率几乎为 0（静止画面）时按采集下限规划，免得算出荒谬的倍率；
-        // 真正的静止画面由运行时判据拦下（采不到样本就不动手）。
-        let s = max(s, minCaptureFPS)
-        let R = max(R, 1)
-        var all: [Candidate] = []
-        for m in supportedMultipliers {
-            let c = evaluate(multiplier: m, sourceFPS: s, refresh: R)
-            guard c.outputFPS <= R * 1.02 else { continue }
-            all.append(c)
-        }
-        if all.isEmpty { return [evaluate(multiplier: 2, sourceFPS: s, refresh: R)] }
-        var byScore = all.sorted {
-            if abs($0.score - $1.score) > 0.01 { return $0.score > $1.score }
-            return $0.multiplier < $1.multiplier
-        }
-        let best = byScore.removeFirst()
-        let fallbacks = all.filter { $0.multiplier < best.multiplier }
-            .sorted { $0.multiplier > $1.multiplier }   // 降档顺序：倍率从高到低
-        return [best] + fallbacks
-    }
-}
-
-// MARK: - 自动倍率的开关与跨重启状态
-let autoRequested = hasFlag("--auto-multiplier")
-let autoDisabled = hasFlag("--no-auto-multiplier")
-/// 默认开：用户明确要「自动适配」，而且固定倍率正是他反复抱怨的东西。
-/// 但**显式** `--multiplier N`（没同时带 --auto-multiplier）视为手选，自动让位 ——
-/// 否则所有测量脚本（都传 --multiplier）会突然跑成另一种行为，历史数据不可比。
-let autoPrefDefaultOn: Bool = {
-    UserDefaults.standard.object(forKey: "autoMultiplier") == nil
-        ? true : UserDefaults.standard.bool(forKey: "autoMultiplier")
-}()
-let autoDisabledByManual = (rawMultiplier != nil) && !autoRequested
-/// 本次进程要用的候选阶梯 / 走到第几档（沿 relaunch 链传递）。
-let autoPlan = (argument("--auto-plan") ?? "").split(separator: ",").compactMap { Int($0) }
-let autoPlanSourceFPS = Double(argument("--auto-source") ?? "") ?? 0
-let autoPlanRefresh = Double(argument("--auto-refresh") ?? "") ?? 0
-let autoStep = Int(argument("--auto-step") ?? "") ?? 0
-let autoReplans = Int(argument("--auto-replans") ?? "") ?? 0
-/// 每档观察多久再判定（秒）。引擎每 60 个源帧写一条统计 —— 24fps 的源要 2.5s 一条，
-/// 所以这个窗口不能太短，否则 24fps 视频一个样本都采不到。
-let autoProbeSeconds = Double(argument("--auto-probe") ?? "") ?? 10
-/// 自动倍率的**上限**（0 = 不限，交给物理上限 floor(刷新率÷24) 决定）。
-/// 给一个「别太激进」的旋钮：例如 24fps 视频在 144Hz 上会被规划到 6×（=144fps 零抖动、
-/// 源一点不损失），但 5 张全是插出来的，补帧痕迹可能偏重 —— 想稳一点就设 3 或 4。
-let autoMaxMultiplier = Int(argument("--auto-max") ?? "") ?? 0
-/// 一档最多降到哪：低于 2× 没有意义。
-let autoMinMultiplier = 2
-/// 一条自适应链里**最多重启几次**（防死循环的硬闸门）。用尽后停手、保持当前档。
-let autoCredit = Int(argument("--auto-credit") ?? "") ?? 6
-/// 诊断/预演用：跳过探测，直接按这个源帧率规划（`--auto-force-source 24`）。
-/// 两种用途：① 我知道我的源就是固定帧率，不想让它先跑 2× 量一遍；
-/// ② 自动化测试要一条**确定性**的路径（否则测出什么全看当时画面在动多快）。
-let autoForcedSourceFPS = Double(argument("--auto-force-source") ?? "") ?? 0
-/// 故障注入（诊断）：把前 N 次判定**故意判成不达标**，用来验证「降档」这条路径真的
-/// 会走、而且走到最低档会停 —— 判定逻辑平时很难自然触发（引擎大多数时候都达标）。
-/// 每降一次自动减 1。
-let autoFailFirst = Int(argument("--auto-fail-first") ?? "") ?? 0
-
-/// 换档时要带给下一个进程的东西（倍率是引擎进程级环境变量，改它只能重启）。
-struct AutoRelaunchInfo {
-    var plan: [Int]
-    var step: Int
-    var sourceFPS: Double
-    var refresh: Double
-    var replans: Int
-    var credit: Int
-    var failFirst: Int = 0
-}
-let autoEnabled: Bool = {
-    if offMode { return false }
-    if autoDisabled { return false }
-    if autoRequested { return true }
-    // `--test-window`（延迟测量/自检）默认不自动 —— 那套流程要求倍率固定不变。
-    if hasFlag("--test-window") { return false }
-    if autoDisabledByManual { return false }
-    return autoPrefDefaultOn
-}()
-/// 探测轮：开了自动但还没有规划 ⇒ 先用 2× 量源帧率。
-let isAutoProbe = autoEnabled && autoPlan.isEmpty
-
-// 主屏刷新率 —— 引擎**按主屏排程**（实测：输出放 60Hz 副屏，引擎仍按主屏 144 排程），
-// 所以自动倍率的一切计算都以主屏为准，而不是「输出窗口所在那块屏」。
-func mainRefreshRate() -> Double {
-    let hz = CGDisplayCopyDisplayMode(CGMainDisplayID())?.refreshRate ?? 0
-    return hz > 1 ? hz : 60
-}
-
-/// 本次进程真正要用的倍率：探测轮固定 2×；试档轮取阶梯上第 autoStep 档；否则手选值。
-let multiplier: Int = {
-    if isAutoProbe { return 2 }
-    if autoEnabled, autoPlan.indices.contains(autoStep) { return autoPlan[autoStep] }
-    if autoEnabled, let last = autoPlan.last { return last }
-    return manualMultiplier
-}()
-
-// `--auto-dry-run`：只打印规划表就退出 —— 用来离线核对打分模型（不动引擎、不开窗）。
-if hasFlag("--auto-dry-run") {
-    let s = Double(argument("--source-fps") ?? "") ?? 60
-    let r = Double(argument("--refresh-hz") ?? "") ?? mainRefreshRate()
-    print("自动倍率规划 · 源 \(String(format: "%.0f", s))fps · 屏 \(String(format: "%.0f", r))Hz"
-          + (isAutoProbe ? "（探测轮，实际先跑 2×）" : ""))
-    var shown = AutoMultiplierPlanner.ladder(sourceFPS: s, refresh: r)
-    if autoMaxMultiplier >= 2 {
-        let capped = shown.filter { $0.multiplier <= autoMaxMultiplier }
-        if !capped.isEmpty { shown = capped }
-    }
-    print("倍率  采集上限  有效源  输出fps  节奏抖动  源损失   延迟ms   评分"
-          + (autoMaxMultiplier >= 2 ? "   ← 上限 \(autoMaxMultiplier)×" : ""))
-    for (i, c) in shown.enumerated() {
-        print(c.summary + (i == 0 ? "   ← 首选（先试这档）" : "   ← 第 \(i) 次降档落点"))
-    }
-    exit(0)
-}
+let multiplier = offMode ? 1 : manualMultiplier
 
 // —— 引擎级省电开关（都是进程级环境变量，改了必须重启进程）——
 //
@@ -289,7 +95,7 @@ if hasFlag("--auto-dry-run") {
 // 官方口径「GPU 负载最多减半」）：引擎换一套轻量着色器，画质略有让步。
 // 实测本工具 3× 插帧下 GPU 功耗 3.40 W → 0.99 W，**生成帧数一张不少**
 // （输出被 vblank 限住，省下的是纯算力）⇒ 笔记本上很值。默认关，界面上可勾。
-let flowScale = argument("--flow-scale") ?? preferences.string(forKey: "flowScale") ?? "1.0"
+let flowScale = "1.0"
 let performanceMode = hasFlag("--performance") || preferences.bool(forKey: "performanceMode")
 // 目标帧率默认 = 屏幕刷新率：生成帧超过这个数屏幕上根本显示不出来，算了也白算。
 let targetFPS: Int = {
@@ -313,12 +119,6 @@ if getenv("WINDOW_INTERP_BOOT") == nil {
         setenv("LSFGM_GENERATOR_MOLTENVK", native.appendingPathComponent("libMoltenVK.dylib").path, 1)
         setenv("LSFGM_STATS", "1", 1)
         setenv("LSFGM_LOG_LEVEL", "info", 1)
-        // 自动倍率要靠引擎自报的遥测做判定（`display intervals … late=` 节奏抖动、
-        // `Metal latency … worker_ms=p50/p95 dropped=`），所以强制打开延迟统计。
-        // 实测这个开关**只报数、不影响性能**（A/B：开与不开都是 26ms，见
-        // dev/LSFGM_LATENCY实测-2026-10-12.md）。放在 --engine-env 透传之前，
-        // 所以命令行仍然可以显式关掉。
-        if autoEnabled { setenv("LSFGM_LATENCY", "1", 1) }
         // 光流分辨率缩放：默认 1.0（画质优先）。菜单里可调低换省电。
         setenv("LSFGM_FLOW_SCALE", flowScale, 1)
         if performanceMode { setenv("LSFGM_PERFORMANCE_MODE", "1", 1) }
@@ -336,6 +136,7 @@ if getenv("WINDOW_INTERP_BOOT") == nil {
     } else {
         unsetenv("DYLD_INSERT_LIBRARIES")
     }
+    setenv("LSFGM_FLOW_SCALE", "1.0", 1)
     let argv = arguments.map { strdup($0) } + [nil]
     argv.withUnsafeBufferPointer { _ = execv(arguments[0], $0.baseAddress!) }
     fputs("无法启动: \(String(cString: strerror(errno)))\n", stderr)
@@ -1348,10 +1149,6 @@ final class FirstMouseButton: NSButton {
     var startButton = NSButton(title: "开始插帧", target: nil, action: nil)
     var multiplierPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     var modePopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    var capturePopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    var resolutionPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    var flowPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    var reconstructPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     /// 「性能模式（轻量着色器）」复选框。菜单栏也要能改它，所以留成属性好同步状态。
     var perfModeCheck = NSButton(checkboxWithTitle: "", target: nil, action: nil)
 
@@ -1384,35 +1181,6 @@ final class FirstMouseButton: NSButton {
     var engineSrcFPS: Double = 0
     /// 引擎每源帧实际生成了几张（Δtotal/Δsource，正常值 = 倍率本身）。
     var engineGenRatio: Double = 0
-    /// 引擎自报的节奏遥测（要 LSFGM_LATENCY=1，自动倍率会强制打开）：
-    ///   `Metal display intervals=240 … late=1` → late/240 = 「晚一个刷新周期」的占比；
-    ///   `Metal latency kind=generated … worker_ms=p50/p95 … dropped=0` → 插值网络耗时与丢帧。
-    /// 读不到时为 nil（不是 0）—— 红线：读不到 ≠ 没有。
-    var engineLateRatio: Double?
-    var engineWorkerP95: Double?
-    var engineDroppedFrames: Int?
-
-    // MARK: 自动倍率运行时状态
-    /// 一档的观测样本。只在引擎**写出新的统计行**时才采（拿不到就不判）。
-    struct AutoSample {
-        let src: Double
-        let out: Double
-        let genRatio: Double
-        var lateRatio: Double?
-        var workerP95: Double?
-        var dropped: Int?
-    }
-    var autoSamples: [AutoSample] = []
-    var autoWindowStart: CFAbsoluteTime = 0
-    /// 是否已定档（定档后才允许因为源帧率大变而重新规划）。
-    var autoSettled = false
-    /// 源帧率持续偏离规划值的秒数（用来触发「内容换了、重新规划」）。
-    var autoDriftSeconds = 0
-    var autoSmoothSrc: Double = 0
-    /// 给用户看的最后一句判定/动作（状态栏与菜单都用它）。
-    var autoStatusText = ""
-    var autoBusy = false
-
     var targets: [CaptureTarget] = []
     var selected: CaptureTarget?
     var enumerateInFlight: Task<Void, Never>?
@@ -1451,25 +1219,15 @@ final class FirstMouseButton: NSButton {
     /// 实现上**不再有 `gameMode` 变量**：贴源覆盖层就是唯一的输出方式，相关分支全部
     /// 无条件化了。唯一还存在的判据是 `useOverlay`（见 openInterpWindow）里的
     /// `--test-window` / `--native-fullscreen` 两个开发用逃逸舱。
-    var captureFPS = Double(argument("--capture-fps") ?? "") ?? 60.0
+    let captureFPS = 60.0
     // 插帧工作分辨率上限（像素高度）。0 = 跟随屏幕，不做额外缩放。
     // 和播放器的「720p / 1080p」是同一个思路 —— 引擎的工作量正比于像素数。
-    var workResolution: Int = {
-        if let v = argument("--resolution"), let n = Int(v), n >= 0 { return n }
-        return UserDefaults.standard.integer(forKey: "workResolution")
-    }()
+    let workResolution = 0
     /// 输出重建档（「档 1」，见 `ReconstructMode`）。
     ///
     /// ⚠️ 解析失败**要喊一声**，别静默回落 —— 这条红线的教训来自 `--multiplier`：
     /// 脚本里写错值被静默吞掉，四轮对照全是废数据。
-    var reconstruct: ReconstructMode = {
-        if let v = argument("--reconstruct") {
-            if let m = ReconstructMode(rawValue: v) { return m }
-            logLine("warn: --reconstruct \"\(v)\" 不认识（认 off/lanczos/cas）→ 回落默认 off")
-            return .off
-        }
-        return ReconstructMode(rawValue: UserDefaults.standard.string(forKey: "reconstructMode") ?? "") ?? .off
-    }()
+    let reconstruct: ReconstructMode = .off
     /// CAS 强度 0…1（只有 `.cas` 档用到）。0 = 与关闭档逐像素一致（自检用）。
     var sharpenAmount: Float = {
         if let v = argument("--reconstruct-sharp"), let f = Float(v) { return min(max(f, 0), 1) }
@@ -1502,12 +1260,7 @@ final class FirstMouseButton: NSButton {
     // 依然稳在「屏幕刷新率 ÷ 倍率」——因为引擎要 present 倍率个帧才把控制权还给
     // 我们，采集端天然被限速。实测延迟：2× ≈ 50ms、3× ≈ 185ms、4× ≈ 285ms，
     // 也就是延迟大致随**倍率的立方**增长。详见 README 的「延迟」章节。
-    var autoMatchFPS: Bool = {
-        if hasFlag("--no-auto-fps") { return false }
-        if hasFlag("--auto-fps") { return true }
-        return UserDefaults.standard.object(forKey: "autoMatchFPS") == nil
-            ? true : UserDefaults.standard.bool(forKey: "autoMatchFPS")
-    }()
+    let autoMatchFPS = false
     /// SCStream 缓冲深度（见 CapturePipeline.queueDepth）。命令行可覆盖，便于测延迟。
     /// 实测：给 1 会让 SCK 大面积丢帧（画面一顿一顿，比 3 更糟），所以下限锁 2。
     var captureQueueDepth = max(2, min(4, Int(argument("--queue-depth") ?? "") ?? 3))
@@ -1533,10 +1286,8 @@ final class FirstMouseButton: NSButton {
     //   eng-* 与源 原样 MAE 2.1 / 竖翻 19.3（同向）；off-* 原样 16.7 / 竖翻 1.4（颠倒）。
     // 「引擎在 = 正立」是 1.1.0 之前就成立的行为，`--off` 一直是倒的、长期无人发现。
     //
-    // `invertVertical`（用户勾的「反转上下」）现在是「相对**正常方向**再翻一次」，
     // 两条路径都成立 —— 所以它必须在两侧取相反的值。
-    var invertVertical = UserDefaults.standard.bool(forKey: "invertVertical")
-    var displayFlip: Bool { offMode ? invertVertical : !invertVertical }
+    var displayFlip: Bool { !offMode }
     var statTimer: Timer?
     var refreshTimer: Timer?
     /// 正在被插帧的那个窗口 id（用于检测它是否还在当前 Space）。
@@ -1579,15 +1330,11 @@ final class FirstMouseButton: NSButton {
         RunLoop.main.add(followTimer!, forMode: .common)
         statTimer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in MainActor.assumeIsolated { watchdog.tick(); self?.tickStatus() } }
         RunLoop.main.add(statTimer!, forMode: .common)
-        // 窗口列表后台预热：这样点开菜单栏时列表已经是新的
-        // （NSMenu 一旦弹出就没法再改内容，只能靠缓存）
+        // 每 5 秒检查运行中的源窗口；不做窗口列表的后台枚举。
         refreshTimer = Timer(timeInterval: 5, target: self, selector: #selector(periodicRefresh), userInfo: nil, repeats: true)
         RunLoop.main.add(refreshTimer!, forMode: .common)
         startWatchdog()
-        let autoDesc = autoEnabled
-            ? " auto=on\(isAutoProbe ? "(探测轮)" : "/plan=\(autoPlan)/step=\(autoStep)") 额度=\(autoCredit) 重规划=\(autoReplans)"
-            : " auto=off"
-        logLine("launch v\(appVersion) pid=\(getpid()) multiplier=\(multiplier) off=\(offMode)\(autoDesc) args=\(arguments.dropFirst().joined(separator: " "))")
+        logLine("launch v\(appVersion) pid=\(getpid()) multiplier=\(multiplier) off=\(offMode) args=\(arguments.dropFirst().joined(separator: " "))")
 
         // 排查用：`--ax-probe <pid>` 打印某进程的 AX 窗口情况
         if let probe = argument("--ax-probe"), let probePid = pid_t(probe) {
@@ -1643,127 +1390,157 @@ final class FirstMouseButton: NSButton {
     // MARK: 控制窗
 
     func buildControlWindow() {
-        controlWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 590),
+        controlWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 660, height: 720),
                                  styleMask: [.titled, .closable, .miniaturizable, .resizable],
                                  backing: .buffered, defer: false)
-        controlWindow.title = "窗口插帧助手 \(offMode ? "· 原帧模式" : "· LSFG \(multiplier)×")"
-        controlWindow.minSize = CGSize(width: 520, height: 420)
+        controlWindow.title = "窗口插帧助手"
+        controlWindow.titlebarAppearsTransparent = true
+        controlWindow.minSize = CGSize(width: 600, height: 700)
         controlWindow.delegate = self
         controlWindow.isReleasedWhenClosed = false
-        // 控制窗跟随所有 Space：Chrome 全屏时用户不必先切走再滑回来 —— 覆盖层方案下
-        // 「当前 Space 必须是源窗口那个」，控制窗跟过去能少一次空间切换。
         controlWindow.collectionBehavior.insert([.canJoinAllSpaces, .fullScreenAuxiliary])
         controlWindow.center()
-        controlWindow.setFrameAutosaveName("control")
+        controlWindow.setFrameAutosaveName("control-v2")
 
         let root = NSView()
+        root.wantsLayer = true
         controlWindow.contentView = root
 
-        let title = NSTextField(labelWithString: "给任意全屏窗口插帧")
-        title.font = .systemFont(ofSize: 17, weight: .semibold)
-        let steps = NSTextField(wrappingLabelWithString: "① 让源窗口进入全屏（网页视频、播放器、游戏都可以）\n② 在下面的列表里选中它（列表可刷新，其他空间的窗口也会列出来）\n③ 点「开始插帧」，画面会直接铺满屏幕盖在源窗口上\n④ 结束按 Esc；若提示「不在当前空间」，四指左右滑到源窗口那个空间即可")
-        steps.font = .systemFont(ofSize: 12)
-        steps.textColor = .secondaryLabelColor
-        steps.preferredMaxLayoutWidth = 560
+        func label(_ text: String, size: CGFloat = 12, weight: NSFont.Weight = .regular,
+                   color: NSColor = .labelColor) -> NSTextField {
+            let field = NSTextField(wrappingLabelWithString: text)
+            field.font = .systemFont(ofSize: size, weight: weight)
+            field.textColor = color
+            return field
+        }
+        func vertical(_ views: [NSView], spacing: CGFloat = 8) -> NSStackView {
+            let stack = NSStackView(views: views)
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            stack.spacing = spacing
+            return stack
+        }
+        func card(_ content: NSView) -> NSView {
+            let box = NSView()
+            box.wantsLayer = true
+            box.layer?.cornerRadius = 12
+            box.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+            box.layer?.borderColor = NSColor.separatorColor.cgColor
+            box.layer?.borderWidth = 0.5
+            content.translatesAutoresizingMaskIntoConstraints = false
+            box.addSubview(content)
+            NSLayoutConstraint.activate([
+                content.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 16),
+                content.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -16),
+                content.topAnchor.constraint(equalTo: box.topAnchor, constant: 14),
+                content.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -14)
+            ])
+            return box
+        }
 
-        hintLabel = NSTextField(labelWithString: "正在读取窗口列表…")
-        hintLabel.font = .systemFont(ofSize: 11)
-        hintLabel.textColor = .tertiaryLabelColor
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: "bolt.circle.fill", accessibilityDescription: "窗口插帧")
+        icon.contentTintColor = .controlAccentColor
+        icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 40, weight: .medium)
+        icon.widthAnchor.constraint(equalToConstant: 48).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 48).isActive = true
+        let titles = vertical([
+            label("窗口插帧助手", size: 24, weight: .bold),
+            label("选一个窗口，让画面更流畅。", size: 13, color: .secondaryLabelColor)
+        ], spacing: 4)
+        let header = NSStackView(views: [icon, titles])
+        header.spacing = 14
+        header.alignment = .centerY
 
         buildTable()
-        let refreshButton = NSButton(title: "刷新窗口列表", target: self, action: #selector(refreshClicked))
-        refreshButton.bezelStyle = .rounded
+        let refresh = NSButton(title: "刷新列表", target: self, action: #selector(refreshClicked))
+        refresh.bezelStyle = .rounded
+        refresh.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "刷新")
+        refresh.imagePosition = .imageLeading
+        let sourceTitle = label("目标窗口", size: 14, weight: .semibold)
+        let spacer = NSView()
+        let sourceHeader = NSStackView(views: [sourceTitle, spacer, refresh])
+        sourceHeader.alignment = .centerY
+        hintLabel = label("正在读取窗口列表…", size: 11, color: .secondaryLabelColor)
+        hintLabel.maximumNumberOfLines = 2
+        let sources = vertical([sourceHeader, tableScroll, hintLabel], spacing: 10)
+        let sourceCard = card(sources)
+        for view in [sourceHeader, tableScroll!, hintLabel] {
+            view.widthAnchor.constraint(equalTo: sources.widthAnchor).isActive = true
+        }
+        tableScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 140).isActive = true
+        tableScroll.setContentHuggingPriority(.defaultLow, for: .vertical)
 
-        // 第 0 项是「自动」：按源窗口帧率自适应选倍率（见文件顶部「自动倍率」注释块）。
-        multiplierPopup.addItems(withTitles: ["自动（按窗口帧率）"] + supportedMultipliers.map {
-            "\($0)× 插帧" + Self.latencyLabel(multiplier: $0, refreshRate: refreshRate)
-        })
-        multiplierPopup.selectItem(at: autoEnabled ? 0 : (supportedMultipliers.firstIndex(of: multiplier) ?? 0) + 1)
-        multiplierPopup.target = self; multiplierPopup.action = #selector(multiplierChanged)
-
-        modePopup.addItems(withTitles: ["抓取方式：窗口（推荐）", "抓取方式：整屏"])
+        multiplierPopup.removeAllItems()
+        multiplierPopup.addItems(withTitles: supportedMultipliers.map { "\($0)× 插帧" })
+        multiplierPopup.selectItem(at: supportedMultipliers.firstIndex(of: multiplier) ?? 0)
+        multiplierPopup.target = self
+        multiplierPopup.action = #selector(multiplierChanged)
+        modePopup.removeAllItems()
+        modePopup.addItems(withTitles: ["窗口（推荐）", "整屏"])
         modePopup.selectItem(at: mode.rawValue)
-        modePopup.target = self; modePopup.action = #selector(modeChanged)
+        modePopup.target = self
+        modePopup.action = #selector(modeChanged)
+        for popup in [multiplierPopup, modePopup] { popup.controlSize = .large }
+        let multiplierColumn = vertical([label("插帧倍数", size: 11, weight: .medium, color: .secondaryLabelColor), multiplierPopup])
+        let modeColumn = vertical([label("抓取方式", size: 11, weight: .medium, color: .secondaryLabelColor), modePopup])
+        multiplierPopup.widthAnchor.constraint(equalTo: multiplierColumn.widthAnchor).isActive = true
+        modePopup.widthAnchor.constraint(equalTo: modeColumn.widthAnchor).isActive = true
+        let options = NSStackView(views: [multiplierColumn, modeColumn])
+        options.distribution = .fillEqually
+        options.spacing = 20
+        let optionsCard = card(options)
+        optionsCard.heightAnchor.constraint(equalToConstant: 88).isActive = true
 
-        capturePopup.addItems(withTitles: ["采集上限 60fps", "采集上限 30fps", "采集上限 24fps"])
-        capturePopup.target = self; capturePopup.action = #selector(captureFPSChanged)
-
-        // 功耗相关的两个开关。实测（M4 / 3× / 60Hz）：
-        //   光流 1.0 + 渲染分辨率 2940×1912 → GPU 5.09 W
-        //   分辨率压到面板 2558×1664      → GPU 3.12 W
-        //   再叠光流 0.5                  → GPU 1.03 W
-        resolutionPopup.addItems(withTitles: Self.resolutionOptions.map { $0.title })
-        resolutionPopup.selectItem(at: Self.resolutionOptions.firstIndex(where: { $0.value == workResolution }) ?? 0)
-        resolutionPopup.target = self; resolutionPopup.action = #selector(resolutionChanged)
-
-        flowPopup.addItems(withTitles: Self.flowScaleOptions.map { $0.title })
-        flowPopup.selectItem(at: Self.flowScaleOptions.firstIndex(where: { $0.value == flowScale }) ?? 0)
-        flowPopup.target = self; flowPopup.action = #selector(flowChanged)
-
-        // 输出重建档（「档 1」）。与「工作分辨率」「光流精度」不同 ——
-        // 它**不用重启进程**：`present()` 每帧都读 `pipeline.reconstruct`，
-        // 改完当场生效，所以下面的 hintLabel 直接说「已生效」而不是「正在重启」。
-        reconstructPopup.addItems(withTitles: ReconstructMode.allCases.map { $0.title })
-        reconstructPopup.selectItem(at: ReconstructMode.allCases.firstIndex(of: reconstruct) ?? 0)
-        reconstructPopup.target = self; reconstructPopup.action = #selector(reconstructChanged)
-
-        // 性能模式（轻量着色器）= 引擎的 `performance_mode`（环境变量 `LSFGM_PERFORMANCE_MODE`）。
-        // 和小黄鸭 LSFG 3.1 那个 Performance mode 是同一个东西：引擎换一套更便宜的着色器。
-        // 实测（源 1920×1080 / 3× / 光流 1.0）：GPU 功耗 3.40 W → 0.99 W，而**生成帧数一模一样**
-        // （source=480 时两边都是 generated=958 —— 输出被 vblank 限住，省下的是纯算力）。
-        // 代价是画质略有让步（引擎侧语义），所以默认关、由用户自己权衡。
-        // 与「光流精度」同类：都是**进程启动那一刻**注入的环境变量 ⇒ 改了必须重启进程。
-        perfModeCheck = NSButton(checkboxWithTitle: "性能模式（轻量着色器）· GPU 功耗约降到 1/3，帧数不变，画质略有代价",
-                                 target: self, action: #selector(perfModeChanged(_:)))
+        perfModeCheck = NSButton(checkboxWithTitle: "性能模式", target: self, action: #selector(perfModeChanged(_:)))
         perfModeCheck.state = performanceMode ? .on : .off
-
-        startButton = NSButton(title: running ? "停止插帧" : "开始插帧", target: self, action: #selector(startStopClicked))
-        startButton.bezelStyle = .rounded
-        startButton.keyEquivalent = "\r"
-        startButton.isEnabled = false
-
-        let flipCheck = NSButton(checkboxWithTitle: "画面上下颠倒（只在显示不正常时才勾）", target: self, action: #selector(flipChanged))
-        flipCheck.state = invertVertical ? .on : .off
-        let badgeCheck = NSButton(checkboxWithTitle: "显示右上角插帧角标（鼠标静止 3 秒后隐藏）", target: self, action: #selector(badgeChanged))
+        perfModeCheck.toolTip = "使用轻量着色器降低 GPU 开销，画质略有让步；切换后自动重启并恢复插帧。"
+        let badgeCheck = NSButton(checkboxWithTitle: "显示右上角插帧角标", target: self, action: #selector(badgeChanged))
         badgeCheck.state = showBadge ? .on : .off
+        badgeCheck.toolTip = "鼠标静止 3 秒后隐藏，在输出区域移动后恢复。"
+        metalHUDCheck.title = "Metal HUD"
         metalHUDCheck.target = self
         metalHUDCheck.action = #selector(toggleMetalHUD)
         metalHUDCheck.state = metalHUDEnabled ? .on : .off
-        // 输出方式只有一个（贴住源窗口的穿透覆盖层），所以这里没有「游戏模式」开关可勾了。
-        // 自动倍率：按源窗口真实帧率选最合适的倍率（先量再定，实测不达标就降档）
-        let autoCheck = NSButton(checkboxWithTitle: "自动倍率：按窗口帧率选最合适的倍率（优先帧率/丝滑，效果不好自动降档）", target: self, action: #selector(autoMultiplierChanged(_:)))
-        autoCheck.state = autoEnabled ? .on : .off
+        metalHUDCheck.toolTip = "实时查看帧率、GPU 耗时等性能数据。"
+        let switches = NSStackView(views: [perfModeCheck, badgeCheck, metalHUDCheck])
+        switches.spacing = 22
+        let note = label("悬浮控件在鼠标静止 3 秒后隐藏，移动后重新显示。", size: 11, color: .secondaryLabelColor)
+        let switchesContent = vertical([switches, note], spacing: 10)
+        let switchesCard = card(switchesContent)
+        switchesCard.heightAnchor.constraint(equalToConstant: 82).isActive = true
+        switches.widthAnchor.constraint(equalTo: switchesContent.widthAnchor).isActive = true
+        note.widthAnchor.constraint(equalTo: switchesContent.widthAnchor).isActive = true
 
-        let topRow = NSStackView(views: [refreshButton, multiplierPopup, modePopup, capturePopup])
-        topRow.spacing = 8
-        let bottomRow = NSStackView(views: [startButton])
-        bottomRow.spacing = 8
-
-        statusLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        startButton = NSButton(title: "开始插帧", target: self, action: #selector(startStopClicked))
+        startButton.bezelStyle = .rounded
+        startButton.controlSize = .large
+        startButton.bezelColor = .controlAccentColor
+        startButton.font = .systemFont(ofSize: 14, weight: .semibold)
+        startButton.keyEquivalent = "\r"
+        startButton.isEnabled = false
+        startButton.widthAnchor.constraint(equalToConstant: 150).isActive = true
+        startButton.heightAnchor.constraint(equalToConstant: 36).isActive = true
+        let shortcut = label("⌃⌥S 开始 / 停止    ⌃⌥P 暂停 / 继续", size: 11, color: .secondaryLabelColor)
+        let footer = NSStackView(views: [shortcut, NSView(), startButton])
+        footer.alignment = .centerY
+        statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
-        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.lineBreakMode = .byTruncatingMiddle
+        statusLabel.stringValue = "选择目标窗口后开始插帧"
 
-        let perfRow = NSStackView(views: [resolutionPopup, flowPopup, reconstructPopup])
-        perfRow.spacing = 8
-
-        let stack = NSStackView(views: [title, steps, topRow, perfRow, perfModeCheck, tableScroll, hintLabel, autoCheck, flipCheck, badgeCheck, metalHUDCheck, bottomRow, statusLabel])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 10
+        let stack = vertical([header, sourceCard, optionsCard, switchesCard, footer, statusLabel], spacing: 16)
         stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.setCustomSpacing(6, after: title)
         root.addSubview(stack)
-
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18),
-            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18),
-            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 18),
-            stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -16),
-            tableScroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            tableScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 180),
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
+            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 20),
+            stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -20)
         ])
-        tableScroll.setContentHuggingPriority(.defaultLow, for: .vertical)
-
+        for view in [header, sourceCard, optionsCard, switchesCard, footer, statusLabel] {
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
         Task { await refreshTargets() }
     }
 
@@ -1774,7 +1551,7 @@ final class FirstMouseButton: NSButton {
         table.headerView = nil
         table.allowsEmptySelection = true
         table.allowsMultipleSelection = false
-        table.rowHeight = 26
+        table.rowHeight = 34
         table.style = .inset
         table.dataSource = self
         table.delegate = self
@@ -1786,7 +1563,7 @@ final class FirstMouseButton: NSButton {
         table.action = #selector(tableClicked)
         tableScroll = NSScrollView()
         tableScroll.hasVerticalScroller = true
-        tableScroll.borderType = .bezelBorder
+        tableScroll.borderType = .noBorder
         tableScroll.drawsBackground = true
         tableScroll.documentView = table
         tableScroll.translatesAutoresizingMaskIntoConstraints = false
@@ -1804,14 +1581,10 @@ final class FirstMouseButton: NSButton {
     @objc func followTick() { followOverlayFrame() }
 
     @objc func periodicRefresh() {
-        // 空闲（控制窗关着、也没在插帧）时一次都不枚举：SCShareableContent 会让
-        // WindowServer 遍历并收集全部窗口的信息（含其它空间），常驻轮询纯属白烧电。
-        guard running || (controlWindow?.isVisible ?? false) else { return }
-        Task {
-            await refreshTargets()
-            if running, mode == .window { followTargetSize() }
-            if running { checkSourceSpace() }
-        }
+        // 窗口枚举按需执行；运行中只检查已有源窗口，避免后台全量枚举。
+        guard running else { return }
+        if mode == .window { followTargetSize() }
+        checkSourceSpace()
     }
 
     /// 源窗口一旦不在当前 Space，WindowServer 会**冻结它的内容**：采集端只剩 `.idle` 帧，
@@ -1845,68 +1618,22 @@ final class FirstMouseButton: NSButton {
                 + "或重新点一次「开始插帧」"
         }
     }
-    @objc func flipChanged(_ sender: NSButton) { invertVertical.toggle(); preferences.set(invertVertical, forKey: "invertVertical"); hintLabel.stringValue = "画面方向已改，重新开始插帧后生效（正在播放的画面不会立刻变）" }
     @objc func badgeChanged(_ sender: NSButton) { showBadge.toggle(); preferences.set(showBadge, forKey: "showBadge"); badge?.isHidden = !showBadge || !floatingControlsVisible; if showBadge { flashHUD() } }
 
     @objc func multiplierChanged() {
-        let idx = multiplierPopup.indexOfSelectedItem
-        if idx <= 0 {
-            // 「自动」：从探测轮重新开始（plan 留空 ⇒ 新进程先跑 2× 量源帧率）
-            preferences.set(true, forKey: "autoMultiplier")
-            relaunch(multiplier: 2, autostart: running, seekTarget: selected?.windowID,
-                     auto: AutoRelaunchInfo(plan: [], step: 0, sourceFPS: 0, refresh: 0,
-                                            replans: 0, credit: autoCredit))
-            return
-        }
-        let chosen = supportedMultipliers[idx - 1]
-        // 手选倍率 = 放弃自动（否则用户点了个 3×，下一轮又被自动改掉，完全无法预期）
-        preferences.set(false, forKey: "autoMultiplier")
+        let index = multiplierPopup.indexOfSelectedItem
+        guard supportedMultipliers.indices.contains(index) else { return }
+        let chosen = supportedMultipliers[index]
+        guard chosen != multiplier else { return }
         preferences.set(chosen, forKey: "multiplier")
         relaunch(multiplier: chosen, autostart: running, seekTarget: selected?.windowID)
     }
 
-    @objc func autoMultiplierChanged(_ sender: NSButton) {
-        let on = sender.state == .on
-        preferences.set(on, forKey: "autoMultiplier")
-        if running {
-            if on {
-                relaunch(multiplier: 2, autostart: true, seekTarget: selected?.windowID,
-                         auto: AutoRelaunchInfo(plan: [], step: 0, sourceFPS: 0, refresh: 0,
-                                                replans: 0, credit: autoCredit))
-            } else {
-                relaunch(multiplier: multiplier, autostart: true, seekTarget: selected?.windowID)
-            }
-        } else {
-            statusLabel.stringValue = on ? "自动倍率已开：开始插帧后先量源帧率再选倍率"
-                                         : "自动倍率已关：改回手选倍率"
-        }
-    }
     @objc func modeChanged() {
         mode = CaptureMode(rawValue: modePopup.indexOfSelectedItem) ?? .window
         preferences.set(mode.rawValue, forKey: "mode")
         hintLabel.stringValue = mode == .window ? "抓单个窗口的内容（源窗口在别的空间也能抓）" : "抓整块屏幕并排除本工具自己的窗口"
     }
-    @objc func resolutionChanged() {
-        let idx = resolutionPopup.indexOfSelectedItem
-        guard idx >= 0, idx < Self.resolutionOptions.count else { return }
-        workResolution = Self.resolutionOptions[idx].value
-        preferences.set(workResolution, forKey: "workResolution")
-        hintLabel.stringValue = "工作分辨率：" + (workResolution == 0 ? "跟随面板像素" : "\(workResolution)p")
-        if running { restartCapture() }
-    }
-
-    @objc func flowChanged() {
-        let idx = flowPopup.indexOfSelectedItem
-        guard idx >= 0, idx < Self.flowScaleOptions.count else { return }
-        preferences.set(Self.flowScaleOptions[idx].value, forKey: "flowScale")
-        hintLabel.stringValue = "光流精度改成 \(Self.flowScaleOptions[idx].value)，正在重启以生效…"
-        // 光流精度是引擎的环境变量，只能在进程启动那一刻注入
-        relaunch(multiplier: multiplier, autostart: running, seekTarget: selected?.windowID)
-    }
-
-    /// 性能模式（轻量着色器）。与「光流精度」同一条路：写偏好 + 重启进程才生效。
-    /// ⚠️ 绝不能把新值当命令行参数转发（见 `relaunch()` 里那段注释）—— 命令行优先级比
-    /// UserDefaults 高，转发旧值会把用户刚勾的选项按回去。唯一真相永远是 UserDefaults。
     @objc func perfModeChanged(_ sender: NSButton) {
         let on = sender.state == .on
         preferences.set(on, forKey: "performanceMode")
@@ -1914,32 +1641,6 @@ final class FirstMouseButton: NSButton {
             ? "性能模式已开：引擎换轻量着色器（实测 GPU 功耗降到约 1/3、帧数不变），正在重启以生效…"
             : "性能模式已关：回到画质优先的着色器，正在重启以生效…"
         relaunch(multiplier: multiplier, autostart: running, seekTarget: selected?.windowID)
-    }
-
-    @objc func captureFPSChanged() {
-        captureFPS = [60.0, 30.0, 24.0][max(0, capturePopup.indexOfSelectedItem)]
-        hintLabel.stringValue = "采集上限 \(Int(captureFPS))fps（源帧率 × 倍率超过屏幕刷新率时，降低采集上限可少丢帧）"
-    }
-
-    /// 输出重建档（「档 1」）。**不用重启进程** —— `present()` 每帧都读这个值。
-    @objc func reconstructChanged() {
-        let idx = reconstructPopup.indexOfSelectedItem
-        guard idx >= 0, idx < ReconstructMode.allCases.count else { return }
-        reconstruct = ReconstructMode.allCases[idx]
-        preferences.set(reconstruct.rawValue, forKey: "reconstructMode")
-        pipeline?.reconstruct = reconstruct          // 立刻生效（下一个渲染帧就是新档）
-        pipeline?.sharpenAmount = sharpenAmount
-        logLine("reconstruct: 切到 \(reconstruct.rawValue) 强度=\(sharpenAmount)")
-        if reconstruct == .off {
-            hintLabel.stringValue = "输出重建：关闭（双线性直通，与旧版逐像素一致）"
-        } else if outputScaleFill {
-            hintLabel.stringValue = "输出重建：\(reconstruct.shortName) · 已生效（输出跟到面板物理像素）"
-        } else {
-            // 输出=采集尺寸时不发生重采样 ⇒ 只有 CAS 的锐化那半在起作用。
-            // 这不是 bug，正是「档 1」最主流的用法（源窗口本来就铺满屏幕）。
-            hintLabel.stringValue = "输出重建：\(reconstruct.shortName) · 已生效"
-                + "（输出=采集尺寸 ⇒ 锐化在起作用；放大那一路要配合 --output-scale fill）"
-        }
     }
 
     // MARK: 窗口枚举
@@ -2149,12 +1850,7 @@ final class FirstMouseButton: NSButton {
                 self.startButton.title = "停止插帧"
                 let modeText = offMode ? "原帧模式" : "LSFG \(multiplier)×"
                 self.statusLabel.stringValue = "插帧中 · 采集 \(captureWidth)×\(captureHeight) @\(Int(fps))fps · \(modeText)"
-                // 倍率明显超出屏幕能力时给一句人话建议（省电的第一件事是别做无用的帧）
-                if let advice = self.frameBudgetAdvice {
-                    self.hintLabel.stringValue = "⚠️ " + advice
-                } else if let latency = self.latencyAdvice {
-                    self.hintLabel.stringValue = "ℹ️ " + latency
-                }
+                self.hintLabel.stringValue = "正在插帧 · 鼠标静止 3 秒后隐藏悬浮控件"
                 logLine("start: ok target=\(target.windowID) \(target.appName) capture=\(captureWidth)x\(captureHeight) fps=\(Int(fps)) mode=\(self.mode) off=\(offMode)")
                 // 自检用：`--test-pause <秒>` 在 N 秒时暂停、N+4 秒时继续。
                 // 「暂停/继续」这条路径必须能自证 —— 否则用户报「暂停之后回不来」时无从判断。
@@ -2612,7 +2308,9 @@ final class FirstMouseButton: NSButton {
         badge?.isHidden = !visible || !showBadge
         badge?.alphaValue = visible ? 1 : 0
         // 隐藏面板同时撤掉命中区域，避免看不见的按钮挡住源窗口。
-        if visible { gameHUD?.orderFrontRegardless() }
+        if visible {
+            if gameHUD?.isVisible == false { gameHUD?.orderFrontRegardless() }
+        }
         else { gameHUD?.orderOut(nil) }
     }
 
@@ -2685,7 +2383,19 @@ final class FirstMouseButton: NSButton {
         interpWindow.toggleFullScreen(nil)
     }
 
-    @objc func showControl() { NSApplication.shared.activate(ignoringOtherApps: true); controlWindow.makeKeyAndOrderFront(nil) }
+    @objc func showControl() {
+        if controlWindow == nil { buildControlWindow() }
+        if controlWindow.isMiniaturized { controlWindow.deminiaturize(nil) }
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        controlWindow.makeKeyAndOrderFront(nil)
+        Task { await refreshTargets() }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        logLine("dock-reopen: 显示控制窗口")
+        showControl()
+        return false
+    }
 
     @objc func openPermissionSettings() {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!
@@ -2993,25 +2703,7 @@ final class FirstMouseButton: NSButton {
     /// 60Hz 屏 + 2× 时源只要能到 30fps 就够，多采的帧等于让引擎白算一遍。
     /// 源本身只有 24/30fps 时 SCK 不会凭空多送帧，所以压低这个上限没有副作用。
     /// 下限取 24：比常见视频帧率还低会真的丢源帧，那时宁可多烧一点也别把画面弄卡。
-    var effectiveCaptureFPS: Double {
-        guard autoMatchFPS, !offMode, multiplier > 1 else { return captureFPS }
-        // 自动倍率模式下**不吃那个「采集上限」下拉**：规划的前提是「采集上限严格 =
-        // 刷新率÷倍率」，用户若把上限设成 30fps，探测到的源帧率会被腰斩、整条阶梯就错了。
-        if autoEnabled { return max(24, (enginePlanRefresh / Double(multiplier)).rounded()) }
-        let budget = (refreshRate / Double(multiplier)).rounded()
-        return max(24, min(captureFPS, budget))
-    }
-
-    /// 当前配置下引擎每秒要多生成多少帧、其中多少显示不出来 —— 用来在界面上
-    /// 给一句人话建议（60Hz 屏上给 30fps 的源配 3× 是纯浪费）。
-    var frameBudgetAdvice: String? {
-        guard !offMode, multiplier > 1 else { return nil }
-        let need = effectiveCaptureFPS * Double(multiplier)
-        guard need > refreshRate + 1 else { return nil }
-        let best = max(2, min(4, Int((refreshRate / effectiveCaptureFPS).rounded(.down))))
-        return String(format: "引擎要出 %.0f fps，屏幕只有 %.0f Hz —— 多余部分显示不出来。建议倍率改成 %d×",
-                      need, refreshRate, best)
-    }
+    var effectiveCaptureFPS: Double { 60 }
 
     /// 端到端延迟估计（毫秒）—— 不是拍脑袋，是 `dev/lat-round.sh`（扫描条相对位置法）
     /// 实测出来的。两套实测（Apple M4 / 光流 0.5 / queueDepth 3 / 工作分辨率 400p）：
@@ -3072,64 +2764,6 @@ final class FirstMouseButton: NSButton {
 
     // MARK: 功耗相关选项
 
-    static let resolutionOptions: [(title: String, value: Int)] = [
-        ("跟随面板像素（推荐 · 无损）", 0),
-        ("1440p（更省）", 1440),
-        ("1080p（很省）", 1080),
-        ("720p（最省，画面会糊）", 720),
-    ]
-
-    static let flowScaleOptions: [(title: String, value: String)] = [
-        ("1.0 满精度（默认 · 画质优先）", "1.0"),
-        ("0.75", "0.75"),
-        ("0.5 省电推荐（GPU 可降约三分之二）", "0.5"),
-        ("0.25 最省电（细密画面可能有瑕疵）", "0.25"),
-    ]
-
-    /// 状态栏菜单顶部那行「当前这套配置在做什么」
-    var perfSummary: String {
-        var bits: [String] = []
-        bits.append(workResolution == 0 ? "分辨率跟随面板" : "分辨率 \(workResolution)p")
-        if offMode {
-            bits.append("原帧模式")
-        } else {
-            bits.append("光流 \(flowScale)")
-            // 性能模式是「省电换画质」那一类，跟光流精度并列写出来，否则用户看不出它开着
-            if performanceMode { bits.append("性能模式") }
-            let fps = Int(effectiveCaptureFPS)
-            bits.append("采集 ≤\(fps)fps")
-            bits.append("\(multiplier)× → \(fps * multiplier)fps")
-            if let ms = estimatedLatencyMS { bits.append("延迟约 \(Int(ms.rounded()))ms") }
-            if autoEnabled {
-                let planTxt = autoPlan.isEmpty ? "待探测" : autoPlan.map { "\($0)×" }.joined(separator: ">")
-                bits.append("自动倍率 \(autoStatusText.isEmpty ? planTxt : autoStatusText)")
-            }
-        }
-        bits.append("屏 \(Int(refreshRate))Hz")
-        if reconstruct != .off {
-            // 输出重建是**额外**的 GPU 活，别让用户以为它是免费的
-            bits.append("重建 \(reconstruct.shortName)\(outputScaleFill ? "·输出跟面板" : "")")
-        }
-        return "功耗： " + bits.joined(separator: " · ")
-    }
-
-    @objc func menuResolution(_ sender: NSMenuItem) {
-        guard let n = sender.representedObject as? NSNumber else { return }
-        workResolution = n.intValue
-        preferences.set(workResolution, forKey: "workResolution")
-        statusLabel.stringValue = "工作分辨率：" + (workResolution == 0 ? "跟随面板像素" : "\(workResolution)p")
-        // 分辨率只影响采集尺寸，不需要重启进程 —— 重开一次插帧即可
-        if running { restartCapture() }
-    }
-
-    @objc func menuFlowScale(_ sender: NSMenuItem) {
-        guard let v = sender.representedObject as? String else { return }
-        preferences.set(v, forKey: "flowScale")
-        // 光流精度是引擎的环境变量，只能在进程启动那一刻注入 ⇒ 必须重启进程
-        relaunch(multiplier: multiplier, autostart: running, seekTarget: selected?.windowID)
-    }
-
-    /// 菜单栏切「性能模式（轻量着色器）」。引擎环境变量 ⇒ 必须重启进程。
     @objc func togglePerfMode() {
         let on = !performanceMode
         preferences.set(on, forKey: "performanceMode")
@@ -3137,40 +2771,6 @@ final class FirstMouseButton: NSButton {
         statusLabel.stringValue = on ? "性能模式已开（轻量着色器）：正在重启以生效…"
                                      : "性能模式已关：正在重启以生效…"
         relaunch(multiplier: multiplier, autostart: running, seekTarget: selected?.windowID)
-    }
-
-    /// 菜单栏切输出重建档。与「光流精度」相反：这个**不需要重启进程**
-    /// （`present()` 每帧读 `pipeline.reconstruct`），所以直接改、当场生效。
-    @objc func menuReconstruct(_ sender: NSMenuItem) {
-        guard let v = sender.representedObject as? String,
-              let m = ReconstructMode(rawValue: v) else { return }
-        reconstruct = m
-        preferences.set(m.rawValue, forKey: "reconstructMode")
-        pipeline?.reconstruct = m
-        pipeline?.sharpenAmount = sharpenAmount
-        // 控制窗可能还没建（菜单栏先于控制窗可用），所以先确认下拉里有这一项
-        let idx = ReconstructMode.allCases.firstIndex(of: m) ?? 0
-        if reconstructPopup.numberOfItems > idx { reconstructPopup.selectItem(at: idx) }
-        statusLabel.stringValue = "输出重建：\(m.title)"
-        logLine("reconstruct: 菜单切到 \(m.rawValue)")
-    }
-
-    @objc func toggleAutoFPS() {
-        autoMatchFPS.toggle()
-        preferences.set(autoMatchFPS, forKey: "autoMatchFPS")
-        statusLabel.stringValue = autoMatchFPS
-            ? "采集帧率自动匹配屏幕刷新率（避免生成显示不出来的帧）"
-            : "采集帧率不再自动匹配"
-        if running { restartCapture() }
-    }
-
-    /// 重开一次插帧（不重启进程）—— 只影响采集参数的改动走这条
-    func restartCapture() {
-        stopInterpolation()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self, self.selected != nil else { return }
-            self.startInterpolation()
-        }
     }
 
     // MARK: 状态栏 / 快捷键
@@ -3186,7 +2786,7 @@ final class FirstMouseButton: NSButton {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        // 列表由 5 秒一次的后台预热维护；这里同步用缓存，菜单才能立刻显示完整内容
+        // 先显示缓存，打开菜单时按需更新一次；不做后台列表预热。
         rebuildStatusMenu()
         Task { await refreshTargets(); if NSApp.currentEvent != nil { rebuildStatusMenu() } }
     }
@@ -3194,192 +2794,65 @@ final class FirstMouseButton: NSButton {
     func rebuildStatusMenu() {
         guard let menu = statusItem.menu else { return }
         menu.removeAllItems()
-
-        let head = NSMenuItem(title: (offMode ? "原帧模式（未插帧）" : "LSFG \(multiplierLabel) 插帧")
-                              + " · v\(appVersion)",
-                              action: nil, keyEquivalent: "")
-        head.isEnabled = false
-        menu.addItem(head)
-        menu.addItem(.separator())
-
-        let startTitle = running ? "停止插帧" : (selected == nil ? "开始插帧（先选窗口）" : "开始插帧：\(selected!.appName)")
-        let startItem = NSMenuItem(title: startTitle, action: #selector(startStopClicked), keyEquivalent: "s")
-        startItem.keyEquivalentModifierMask = [.control, .option]
-        startItem.target = self
-        startItem.isEnabled = running || selected != nil
-        menu.addItem(startItem)
-
-        let showItem = NSMenuItem(title: "显示输出全屏窗口", action: #selector(focusInterp), keyEquivalent: "")
-        showItem.target = self
-        showItem.isEnabled = interpWindow != nil
-        menu.addItem(showItem)
-
-        menu.addItem(NSMenuItem(title: "显示控制窗口", action: #selector(showControl), keyEquivalent: ""))
-        menu.items.last?.target = self
-
-        menu.addItem(.separator())
-
-        let windowMenu = NSMenu()
-        if targets.isEmpty {
-            let none = NSMenuItem(title: "（没有可采集的窗口，点下面刷新）", action: nil, keyEquivalent: "")
-            none.isEnabled = false
-            windowMenu.addItem(none)
-        }
-        for t in targets.prefix(40) {
-            let item = NSMenuItem(title: t.display, action: #selector(menuTargetClicked(_:)), keyEquivalent: "")
+        @discardableResult
+        func add(_ title: String, _ action: Selector?, checked: Bool? = nil) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
             item.target = self
-            item.representedObject = NSNumber(value: t.windowID)
-            item.state = (selected?.windowID == t.windowID) ? .on : .off
-            windowMenu.addItem(item)
+            if let checked { item.state = checked ? .on : .off }
+            menu.addItem(item)
+            return item
         }
-        let srcItem = NSMenuItem(title: "选择目标窗口", action: nil, keyEquivalent: "")
-        srcItem.submenu = windowMenu
-        menu.addItem(srcItem)
-        let refreshItem = NSMenuItem(title: "刷新窗口列表", action: #selector(refreshMenu), keyEquivalent: "r")
-        refreshItem.keyEquivalentModifierMask = [.control, .option]
-        refreshItem.target = self
-        menu.addItem(refreshItem)
-
+        add("窗口插帧助手 · \(multiplier)× · v\(appVersion)", nil).isEnabled = false
         menu.addItem(.separator())
-        let multMenu = NSMenu()
-        let autoItem = NSMenuItem(title: "自动（按窗口帧率）", action: #selector(menuAutoMultiplier), keyEquivalent: "")
-        autoItem.target = self
-        autoItem.state = autoEnabled ? .on : .off
-        multMenu.addItem(autoItem)
-        multMenu.addItem(.separator())
-        for m in supportedMultipliers {
-            let item = NSMenuItem(title: "\(m)× 插帧\(m > 4 ? "（扩展引擎）" : "")"
-                                  + Self.latencyLabel(multiplier: m, refreshRate: refreshRate),
-                                  action: #selector(menuMultiplier(_:)), keyEquivalent: "")
+        add("显示控制窗口", #selector(showControl))
+        let start = add(running ? "停止插帧" : "开始插帧", #selector(startStopClicked))
+        start.isEnabled = running || selected != nil
+        start.keyEquivalent = "s"
+        start.keyEquivalentModifierMask = [.control, .option]
+        if running { add(paused ? "继续插帧" : "暂停插帧", #selector(pauseClicked)) }
+        menu.addItem(.separator())
+        let sources = NSMenu()
+        for target in targets.prefix(40) {
+            let item = NSMenuItem(title: target.display, action: #selector(menuTargetClicked(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = NSNumber(value: m)
-            item.state = (m == multiplier && !offMode) ? .on : .off
-            multMenu.addItem(item)
+            item.representedObject = NSNumber(value: target.windowID)
+            item.state = selected?.windowID == target.windowID ? .on : .off
+            sources.addItem(item)
         }
-        multMenu.addItem(.separator())
-        let oriItem = NSMenuItem(title: "原帧模式（对比用）", action: #selector(menuOriginal), keyEquivalent: "")
-        oriItem.target = self
-        oriItem.state = offMode ? .on : .off
-        multMenu.addItem(oriItem)
-        let mm = NSMenuItem(title: "插帧倍率", action: nil, keyEquivalent: "")
-        mm.submenu = multMenu
-        menu.addItem(mm)
-
-        let modeMenu = NSMenu()
-        for (i, title) in ["抓取方式：窗口", "抓取方式：整屏"].enumerated() {
+        if sources.items.isEmpty { sources.addItem(withTitle: "暂无窗口，请刷新列表", action: nil, keyEquivalent: "") }
+        add("选择目标窗口", nil).submenu = sources
+        add("刷新窗口列表", #selector(refreshMenu))
+        let multipliers = NSMenu()
+        for value in supportedMultipliers {
+            let item = NSMenuItem(title: "\(value)× 插帧", action: #selector(menuMultiplier(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = NSNumber(value: value)
+            item.state = value == multiplier ? .on : .off
+            multipliers.addItem(item)
+        }
+        add("插帧倍数", nil).submenu = multipliers
+        let modes = NSMenu()
+        for (index, title) in ["窗口（推荐）", "整屏"].enumerated() {
             let item = NSMenuItem(title: title, action: #selector(menuMode(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = NSNumber(value: i)
-            item.state = (i == mode.rawValue) ? .on : .off
-            modeMenu.addItem(item)
+            item.representedObject = NSNumber(value: index)
+            item.state = index == mode.rawValue ? .on : .off
+            modes.addItem(item)
         }
-        let modeItem = NSMenuItem(title: "抓取方式", action: nil, keyEquivalent: "")
-        modeItem.submenu = modeMenu
-        menu.addItem(modeItem)
-
-        // 「游戏模式」菜单项已删（2026-10-12 第十三轮）：贴源覆盖层现在是唯一的输出方式。
-
-        // 自动倍率的「现在在干什么」一行 —— 不写这个，用户只能看日志猜为什么倍率变了
-        if autoEnabled {
-            let planTxt = autoPlan.isEmpty ? "待探测" : autoPlan.map { "\($0)×" }.joined(separator: " > ")
-            let detail = autoPlanSourceFPS > 1
-                ? String(format: "源 %.0ffps · 阶梯 %@ · 第 %d 档", autoPlanSourceFPS, planTxt, autoStep + 1)
-                : "阶梯 \(planTxt)"
-            let autoInfo = NSMenuItem(title: "自动倍率：\(detail)（\(autoStatusText.isEmpty ? "观察中" : autoStatusText)）",
-                                      action: nil, keyEquivalent: "")
-            autoInfo.isEnabled = false
-            menu.addItem(autoInfo)
-            // 手动重探：源换了内容（视频→游戏）而自动没察觉时的出口 ——
-            // 高倍率下采集上限把源帧率钳住了，这时「源变没变」本来就测不出来
-            // （两边读数都被钳到同一个上限），只能靠人点一下。
-            let reItem = NSMenuItem(title: "自动倍率 ⟳ 立即重新探测源帧率",
-                                    action: #selector(menuAutoMultiplier), keyEquivalent: "")
-            reItem.target = self
-            menu.addItem(reItem)
-        }
-
-        // —— 功耗相关 ——
-        // 实测（M4，3× 插帧，60Hz 屏）：光流 1.0 + 渲染分辨率 2940×1912 = GPU 5.09 W；
-        // 只把渲染分辨率压到面板像素 → 3.12 W；再叠光流 0.5 → 1.03 W（降 80%）。
+        add("抓取方式", nil).submenu = modes
         menu.addItem(.separator())
-        let perfHead = NSMenuItem(title: perfSummary, action: nil, keyEquivalent: "")
-        perfHead.isEnabled = false
-        menu.addItem(perfHead)
-
-        let resMenu = NSMenu()
-        for opt in Self.resolutionOptions {
-            let item = NSMenuItem(title: opt.title, action: #selector(menuResolution(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = NSNumber(value: opt.value)
-            item.state = (opt.value == workResolution) ? .on : .off
-            resMenu.addItem(item)
-        }
-        let resItem = NSMenuItem(title: "插帧工作分辨率", action: nil, keyEquivalent: "")
-        resItem.submenu = resMenu
-        menu.addItem(resItem)
-
-        let flowMenu = NSMenu()
-        for opt in Self.flowScaleOptions {
-            let item = NSMenuItem(title: opt.title, action: #selector(menuFlowScale(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = opt.value
-            item.state = (opt.value == flowScale) ? .on : .off
-            flowMenu.addItem(item)
-        }
-        let flowItem = NSMenuItem(title: "光流精度（最影响功耗）", action: nil, keyEquivalent: "")
-        flowItem.submenu = flowMenu
-        menu.addItem(flowItem)
-
-        // 性能模式（轻量着色器）= 引擎 `performance_mode`，小黄鸭 LSFG 3.1 的同名功能。
-        // 它是**引擎环境变量**（改了要重启进程），所以不做成子菜单，直接一项勾选。
-        let perfModeItem = NSMenuItem(title: "性能模式（轻量着色器 · 省电约 2/3）",
-                                      action: #selector(togglePerfMode), keyEquivalent: "")
-        perfModeItem.target = self
-        perfModeItem.state = performanceMode ? .on : .off
-        menu.addItem(perfModeItem)
-
-        // 输出重建档（「档 1」）。放在功耗两项之后，因为它也是「画质 vs 开销」那一类。
-        let recMenu = NSMenu()
-        for m in ReconstructMode.allCases {
-            let item = NSMenuItem(title: m.title, action: #selector(menuReconstruct(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = m.rawValue
-            item.state = (m == reconstruct) ? .on : .off
-            recMenu.addItem(item)
-        }
-        let recItem = NSMenuItem(title: "输出重建（画质）", action: nil, keyEquivalent: "")
-        recItem.submenu = recMenu
-        menu.addItem(recItem)
-
-        let fpsItem = NSMenuItem(title: "采集帧率自动匹配屏幕", action: #selector(toggleAutoFPS), keyEquivalent: "")
-        fpsItem.target = self
-        fpsItem.state = autoMatchFPS ? .on : .off
-        menu.addItem(fpsItem)
-
-        let metalItem = NSMenuItem(title: "Metal HUD（帧率 / GPU 性能）", action: #selector(toggleMetalHUD), keyEquivalent: "")
-        metalItem.target = self
-        metalItem.state = metalHUDEnabled ? .on : .off
-        menu.addItem(metalItem)
-
-        let badgeItem = NSMenuItem(title: "显示插帧角标（自动隐藏）", action: #selector(toggleBadge), keyEquivalent: "")
-        badgeItem.target = self
-        badgeItem.state = showBadge ? .on : .off
-        menu.addItem(badgeItem)
-        let flipItem = NSMenuItem(title: "画面上下颠倒（显示不正常时才用）", action: #selector(toggleFlip), keyEquivalent: "")
-        flipItem.target = self
-        flipItem.state = invertVertical ? .on : .off
-        menu.addItem(flipItem)
-
-        menu.addItem(.separator())
+        add("性能模式", #selector(togglePerfMode), checked: performanceMode)
+        add("显示右上角插帧角标", #selector(toggleBadge), checked: showBadge)
+        add("Metal HUD", #selector(toggleMetalHUD), checked: metalHUDEnabled)
         if !CGPreflightScreenCaptureAccess() {
-            let perm = NSMenuItem(title: "⚠️ 打开「屏幕录制」权限设置", action: #selector(openPermissionSettings), keyEquivalent: "")
-            perm.target = self
-            menu.addItem(perm)
             menu.addItem(.separator())
+            add("打开屏幕录制权限设置", #selector(openPermissionSettings))
         }
-        let quit = NSMenuItem(title: "退出（⌃⌥Q）", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(.separator())
+        let quit = add("退出", #selector(NSApplication.terminate(_:)))
+        quit.target = NSApplication.shared
+        quit.keyEquivalent = "q"
         quit.keyEquivalentModifierMask = [.control, .option]
-        menu.addItem(quit)
     }
 
     @objc func menuTargetClicked(_ sender: NSMenuItem) {
@@ -3396,21 +2869,11 @@ final class FirstMouseButton: NSButton {
         w.makeKeyAndOrderFront(nil)
     }
     @objc func toggleBadge() { showBadge.toggle(); preferences.set(showBadge, forKey: "showBadge"); badge?.isHidden = !showBadge || !floatingControlsVisible; if showBadge { flashHUD() } }
-    @objc func toggleFlip() { invertVertical.toggle(); preferences.set(invertVertical, forKey: "invertVertical"); statusLabel.stringValue = "画面方向已改，重新开始插帧后生效（当前播放不会变）" }
 
     @objc func menuMultiplier(_ sender: NSMenuItem) {
         guard let n = sender.representedObject as? NSNumber else { return }
         preferences.set(n.intValue, forKey: "multiplier")
         relaunch(multiplier: n.intValue, autostart: running, seekTarget: selected?.windowID)
-    }
-    @objc func menuAutoMultiplier() {
-        preferences.set(true, forKey: "autoMultiplier")
-        relaunch(multiplier: 2, autostart: running, seekTarget: selected?.windowID,
-                 auto: AutoRelaunchInfo(plan: [], step: 0, sourceFPS: 0, refresh: 0,
-                                        replans: 0, credit: autoCredit))
-    }
-    @objc func menuOriginal() {
-        relaunch(multiplier: multiplier, autostart: running, seekTarget: selected?.windowID, forceOff: true)
     }
     @objc func menuMode(_ sender: NSMenuItem) {
         guard let n = sender.representedObject as? NSNumber else { return }
@@ -3430,45 +2893,22 @@ final class FirstMouseButton: NSButton {
 
     // MARK: 重启进程（倍率/开关是引擎环境变量，改不了只能重启）
 
-    func relaunch(multiplier m: Int, autostart: Bool, seekTarget: CGWindowID?, forceOff: Bool = false,
-                  auto: AutoRelaunchInfo? = nil) {
+    func relaunch(multiplier m: Int, autostart: Bool, seekTarget: CGWindowID?, forceOff: Bool = false) {
         stopInterpolation()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: arguments[0])
         var args: [String] = []
         if forceOff || offMode { args.append("--off") }
         args += ["--multiplier", String(m)]
-        // 自动倍率的跨重启状态。plan 为空 = 重新走探测轮（新进程会先跑 2× 量源帧率）。
-        if let a = auto {
-            args.append("--auto-multiplier")
-            if !a.plan.isEmpty {
-                args += ["--auto-plan", a.plan.map(String.init).joined(separator: ",")]
-                args += ["--auto-step", String(a.step)]
-            }
-            if a.sourceFPS > 0 { args += ["--auto-source", String(Int(a.sourceFPS.rounded()))] }
-            if a.refresh > 0 { args += ["--auto-refresh", String(Int(a.refresh.rounded()))] }
-            args += ["--auto-replans", String(a.replans)]
-            args += ["--auto-credit", String(a.credit)]
-            if autoMaxMultiplier >= 2 { args += ["--auto-max", String(autoMaxMultiplier)] }
-            if autoProbeSeconds != 10 { args += ["--auto-probe", String(Int(autoProbeSeconds))] }
-            if a.failFirst > 0 { args += ["--auto-fail-first", String(a.failFirst)] }
-        }
         // 输出方式已经没有开关了（贴源覆盖层是唯一方式），所以这里不再转发 `--game-mode`。
-        // 省电相关的选择也要带过去，否则改完倍率重启一次就丢了
-        if workResolution > 0 { args += ["--resolution", String(workResolution)] }
-        // ⚠️ 千万不要在这里传 --flow-scale / --performance。
-        // 这两个的全局值是**进程启动那一刻**求值的，用户改完设置后它还是旧值；
-        // 而命令行参数的优先级又高于 UserDefaults ⇒ 新进程照样读回旧值，
-        // 现象就是「光流选了 0.5 也没用，永远 1.0，界面勾选还会自动弹回去」。
-        // 它们的唯一真相是 UserDefaults（改设置时就写好了），新进程自己会读。
+        // 性能模式由新进程读取已保存偏好，不能转发旧进程的启动值。
         if mode == .display { args += ["--mode", "display"] }
-        if captureFPS != 60 { args += ["--capture-fps", String(Int(captureFPS))] }
         // 诊断用的引擎开关透传也要跟着走，否则改一次倍率就把探测配置丢了
         for kv in arguments(named: "--engine-env") { args += ["--engine-env", kv] }
         // 自检/测量布置也要跟着走 —— 自动换档一次就把它们丢了的话，本来在 620×400
         // 小窗里跑的自检会突然变成全屏覆盖层，整条测量链就废了（踩过这种）。
         // ⚠️ 故意**不转发** `--test-seconds`：那会让每一档都重新计时，总时长失控。
-        for flag in ["--test-window", "--auto-fps", "--no-auto-fps",
+        for flag in ["--test-window",
                      "--native-fullscreen", "--ignore-pixel-cap"] where hasFlag(flag) {
             args.append(flag)
         }
@@ -3478,7 +2918,7 @@ final class FirstMouseButton: NSButton {
         // `--output-scale` 是纯诊断开关、不持久化，所以要跟着走。
         if outputScaleFill { args += ["--output-scale", "fill"] }
         for key in ["--test-x", "--test-y", "--test-w", "--test-h",
-                    "--queue-depth", "--drawable-count", "--auto-force-source"] {
+                    "--queue-depth", "--drawable-count"] {
             if let v = argument(key) { args += [key, v] }
         }
         if let seekTarget { args += ["--window-id", String(seekTarget)]; if autostart { args.append("--autostart") } }
@@ -3492,285 +2932,7 @@ final class FirstMouseButton: NSButton {
         catch { statusLabel.stringValue = "重启失败：\(error.localizedDescription)" }
     }
 
-    // MARK: 自动倍率（按窗口帧率自适应）
-
-    /// 界面上给倍率加「自动」前缀，一眼能看出这是工具选的还是手选的。
-    var multiplierLabel: String { autoEnabled ? "自动 \(multiplier)×" : "\(multiplier)×" }
-
-    /// 引擎排程用的刷新率 = **主屏**刷新率。
-    /// 实测引擎按主屏排程（输出放 60Hz 副屏时仍按主屏 144 算，2× 多吃 ~60ms），
-    /// 所以自动倍率的规划与采集上限都必须用这个，而不是「输出窗口所在那块屏」。
-    var enginePlanRefresh: Double {
-        let hz = mainRefreshRate()
-        return hz > 1 ? hz : refreshRate
-    }
-
-    /// 从引擎日志尾部抓「最近一次」的节奏/延迟遥测（需要引擎带 LSFGM_LATENCY=1，
-    /// 自动倍率会强制打开）。读不到就保持 nil —— 红线：读不到 ≠ 没有问题，不许拿 0 冒充。
-    func refreshEngineTelemetry(_ text: String) {
-        let lines = text.components(separatedBy: "\n")
-        // (lsfg-metal) [INFO]: Metal display intervals=240 p50_ms=6.945 p95_ms=6.945 stdev_ms=0.000 late=1
-        if let l = lines.last(where: { $0.contains("Metal display intervals=") }) {
-            func number(_ key: String) -> Double? {
-                guard let r = l.range(of: key) else { return nil }
-                return Double(l[r.upperBound...].prefix(while: { $0.isNumber || $0 == "." }))
-            }
-            if let intervals = number("intervals="), intervals > 0, let late = number("late=") {
-                engineLateRatio = late / intervals
-            }
-        }
-        // (lsfg-metal) [INFO]: Metal latency kind=generated samples=120 dropped=0 … worker_ms=7.044/19.745 …
-        if let l = lines.last(where: { $0.contains("Metal latency kind=generated") }) {
-            if let r = l.range(of: "worker_ms=") {
-                let seg = l[r.upperBound...].prefix(while: { $0.isNumber || $0 == "." || $0 == "/" })
-                let p = seg.split(separator: "/")
-                if p.count == 2 { engineWorkerP95 = Double(p[1]) }
-            }
-            if let r = l.range(of: "dropped=") {
-                engineDroppedFrames = Int(l[r.upperBound...].prefix(while: { $0.isNumber }))
-            }
-        }
-    }
-
-    /// 当前这一档的「规划预期」（探测轮没有预期 → nil）。
-    var autoPlannedCandidate: AutoMultiplierPlanner.Candidate? {
-        guard !isAutoProbe, autoPlanSourceFPS > 1 else { return nil }
-        let r = autoPlanRefresh > 1 ? autoPlanRefresh : enginePlanRefresh
-        return AutoMultiplierPlanner.evaluate(multiplier: multiplier, sourceFPS: autoPlanSourceFPS, refresh: r)
-    }
-
-    /// 判定「这一档效果好不好」。返回 nil = 达标（保持），否则返回降档原因（人话）。
-    /// 判据全部来自引擎自己的遥测，**不做主观猜测**：
-    ///   ① 输出没到规划的 85% —— 引擎没插出该有的帧数，或源没跟上（**这条已经涵盖**了
-    ///      「生成比例不足」：`输出 = 源帧率 × Δtotal/Δsource`，比例掉下来输出就掉）；
-    ///   ② 节奏抖动 late 占比 > 15% —— 帧不整齐（实测 3× 是 3.8%、2× 是 26%）；
-    ///   ③ 引擎丢帧 且 输出没到规划值 —— 真的算不过来。
-    ///
-    /// ⚠️ 踩过并撤掉的判据：「插值单帧 worker p95 > 2.5 个刷新周期」。实测 5×/620×400
-    /// 时 worker p95 = 18.6ms（6.9ms 预算的 2.7 倍），但那一次 **late 只有 1/240、dropped=0、
-    /// 输出满产 145fps** —— 客观表现是最好的那一档，却会被这条判据误杀。worker 的 p95 是
-    /// 瞬时尖峰（同一份日志里 p50 只有 5.5ms），**代理指标不能压过真实结果**（项目红线）。
-    /// 所以它降级为「只写日志、不参与判定」 —— 要诊断时人去看。
-    ///
-    /// 样本不足一律返回 nil（判不了就不动手，绝不当成「很好」）。
-    func autoVerdict() -> String? {
-        // 故障注入：专门用来验证「降档」这条路径（平时引擎基本都达标，走不到）
-        if autoFailFirst > 0 { return "故障注入：故意判为不达标（还剩 \(autoFailFirst - 1) 次）" }
-        guard let planned = autoPlannedCandidate else { return nil }
-        let usable = autoSamples.filter { $0.src > 1 }
-        guard usable.count >= 3 else { return nil }
-        let n = Double(usable.count)
-        let outAvg = usable.map(\.out).reduce(0, +) / n
-        let outRatio = outAvg / max(planned.outputFPS, 1)
-        if outRatio < 0.85 {
-            return String(format: "输出只有 %.0f/%.0f fps", outAvg, planned.outputFPS)
-        }
-        let lates = usable.compactMap(\.lateRatio)
-        if !lates.isEmpty {
-            let avg = lates.reduce(0, +) / Double(lates.count)
-            if avg > 0.15 { return String(format: "节奏抖动 %.0f%%", avg * 100) }
-        }
-        let dropped = usable.compactMap(\.dropped).reduce(0, +)
-        if dropped > 0 && outRatio < 0.97 { return "引擎丢帧 \(dropped) 帧" }
-        return nil
-    }
-
-    /// 判定用的样本里，源帧率的平均近似（样本少时够稳）。
-    func autoSampleSourceAvg() -> Double {
-        let usable = autoSamples.filter { $0.src > 1 }
-        guard !usable.isEmpty else { return 0 }
-        return usable.map(\.src).reduce(0, +) / Double(usable.count)
-    }
-
-    /// 「在当前倍率下，源帧率**本该**读到多少」—— 规划值先被采集上限（R÷倍率）钳一次。
-    ///
-    /// ⚠️ 实测踩过：拿**被采集上限钳过**的观测值直接跟**未钳的规划值**比，会把
-    /// 「4× 把 60fps 源钳到 36」误判成「源帧率掉了 42%」⇒ 白跑一次重新探测
-    /// （日志实证：`试档期间源帧率变成 35fps（规划时 60）→ 重新探测`，而真实源是 69fps）。
-    /// 判断「内容换没换」必须做同口径比较 —— 否则是测量学错误，不是策略问题。
-    func autoExpectedSourceFPS() -> Double {
-        guard autoPlanSourceFPS > 1 else { return 0 }
-        let r = autoPlanRefresh > 1 ? autoPlanRefresh : enginePlanRefresh
-        return min(autoPlanSourceFPS, AutoMultiplierPlanner.captureCap(multiplier, refresh: r))
-    }
-
-    /// 自动倍率的「换档」= 重启进程，走 UI 那条 relaunch 的同一条路，
-    /// 额外把阶梯 / 档位 / 重规划次数 / 剩余重启额度带过去。
-    func autoRelaunch(plan: [Int], step: Int, sourceFPS: Double, refresh: Double,
-                      reason: String, replans: Int? = nil) {
-        guard autoCredit > 0 else {
-            autoSettled = true
-            autoStatusText = "自动倍率：重启额度已用尽，保持 \(multiplier)×"
-            logLine("auto: 重启额度用尽 → 保持 \(multiplier)×（原计划：\(reason)）")
-            return
-        }
-        let target = plan.indices.contains(step) ? plan[step] : 2
-        let info = AutoRelaunchInfo(plan: plan, step: step, sourceFPS: sourceFPS,
-                                    refresh: refresh, replans: replans ?? autoReplans,
-                                    credit: autoCredit - 1,
-                                    failFirst: max(0, autoFailFirst - 1))
-        logLine("auto: relaunch → \(target)×（\(reason)）plan=\(plan) step=\(step) 剩余额度=\(autoCredit - 1)")
-        relaunch(multiplier: target, autostart: true,
-                 seekTarget: selected?.windowID ?? (interpTargetID != 0 ? interpTargetID : nil),
-                 auto: info)
-    }
-
-    /// 自动倍率主循环（每秒一次）：探测 → 规划 → 试档 → 判定 → 降档/定档。
-    /// 定档之后改为「盯着源帧率有没有大变」，变了才重新规划。
-    func autoMultiplierTick() {
-        guard !autoBusy, running, !paused, pipeline != nil else { return }
-        if autoWindowStart == 0 {
-            autoWindowStart = CACurrentMediaTime()
-            autoSamples.removeAll()
-            autoStatusText = isAutoProbe ? "自动倍率：正在量源窗口帧率…"
-                                         : "自动倍率：正在观察 \(multiplier)× …"
-            logLine("auto: 开始观察（\(isAutoProbe ? "探测轮" : "试档 \(multiplier)×")）"
-                    + " probe=\(Int(autoProbeSeconds))s plan=\(autoPlan) step=\(autoStep) 剩余额度=\(autoCredit)")
-            return
-        }
-        if autoSettled { autoCheckSourceDrift(); return }
-
-        let elapsed = CACurrentMediaTime() - autoWindowStart
-        let usableNow = autoSamples.filter { $0.src > 1 }
-        // 观测窗要同时满足「时间到」和「样本够」：
-        //   探测轮只要 2 条（引擎给的 source_fps 本身就是 60 个源帧的均值，已经够准）；
-        //   判定轮要 3 条（要估输出帧率与节奏抖动，样本多一点更稳）。
-        // ⚠️ 实测踩过：样本不够时必须**继续攒**，绝不能把窗口和样本一起清空 ——
-        // 清了就变成「攒不够 → 清空 → 重新计时 → 又攒不够」的死循环，而且一个字都不落日志
-        // （症状：日志静默 47 秒、界面停在「观察中」，看起来像卡死）。只在硬超时
-        // （3 倍观察窗）才放弃。5× 时引擎每 60 个源帧才写一条统计 ≈ 2.1s，3 条要 ~6s，
-        // 这就是必须留余量的原因。
-        let need = isAutoProbe ? 2 : 3
-        let timedOut = elapsed >= autoProbeSeconds * 3
-        if elapsed < autoProbeSeconds || (usableNow.count < need && !timedOut) {
-            if elapsed >= autoProbeSeconds {
-                autoStatusText = "自动倍率：等引擎统计样本（\(usableNow.count)/\(need) 条）…"
-            }
-            return
-        }
-
-        autoBusy = true
-        defer {
-            autoBusy = false
-            autoWindowStart = CACurrentMediaTime()
-            autoSamples.removeAll()
-        }
-
-        if isAutoProbe {
-            // ——— 探测轮：量出源帧率 → 排阶梯 ———
-            let usable = usableNow
-            let measured = usable.map(\.src).max()
-            let s = autoForcedSourceFPS > 0 ? autoForcedSourceFPS : (measured ?? 0)
-            guard s >= 12 else {
-                // ⚠️ 静止画面 / 暂停：源帧率根本读不出来。不硬猜（猜错就是「一开就乱跳倍率」），
-                // 保持 2×，等有动静再探。
-                autoStatusText = "自动倍率：画面太静量不出源帧率，先保持 2×（有动静会自动再探）"
-                logLine("auto: 探测失败（样本 \(autoSamples.count) 条，源帧率实测 \(measured.map { "\($0)" } ?? "无")）→ 保持 2×")
-                return
-            }
-            if autoForcedSourceFPS > 0 {
-                logLine("auto: ⚠️ 源帧率由 --auto-force-source 指定为 \(Int(s))fps"
-                        + "（实测 \(measured.map { String(format: "%.0f", $0) } ?? "无")）—— 诊断路径")
-            }
-            let r = enginePlanRefresh
-            var ladder = AutoMultiplierPlanner.ladder(sourceFPS: s, refresh: r)
-            if autoMaxMultiplier >= 2 { ladder = ladder.filter { $0.multiplier <= autoMaxMultiplier } }
-            if ladder.isEmpty { ladder = AutoMultiplierPlanner.ladder(sourceFPS: s, refresh: r) }
-            let plan = ladder.map(\.multiplier)
-            logLine("auto: 探测到源 \(Int(s))fps / 屏 \(Int(r))Hz → 阶梯 \(plan)"
-                    + (autoMaxMultiplier >= 2 ? "（上限 \(autoMaxMultiplier)×）" : ""))
-            for c in ladder { logLine("auto:   \(c.summary)") }
-            if plan.first == multiplier {
-                autoSettled = true
-                autoStatusText = "自动倍率：源 \(Int(s))fps → \(multiplier)× 已是最优（屏 \(Int(r))Hz）"
-                logLine("auto: 定档 \(multiplier)×（探测轮跑的就是它，无需重启）")
-            } else {
-                autoStatusText = "自动倍率：源 \(Int(s))fps → 试 \(plan.first!)×"
-                autoRelaunch(plan: plan, step: 0, sourceFPS: s, refresh: r,
-                             reason: "源 \(Int(s))fps，改用 \(plan.first!)×")
-            }
-            return
-        }
-
-        // ——— 试档轮：判定，不达标就往下降 ———
-        let usable = usableNow
-        if usable.count < 3 {
-            // 走到这里只可能是硬超时（3 倍观察窗）还没攒够样本
-            autoSettled = true
-            autoStatusText = "自动倍率：引擎没给够统计样本，保持 \(multiplier)×"
-            logLine("auto: 试档 \(multiplier)× 超时仍只有 \(autoSamples.count) 条样本 → 保持（不猜）")
-            return
-        }
-        // 源帧率跟规划时对不上（内容换了）⇒ 重新规划，而不是误判成「这一档不行」。
-        // 这一条必须放在判定之前：否则「源变慢了」会被当成「倍率太高」而白白降档。
-        let srcAvg = autoSampleSourceAvg()
-        let expectedSrc = autoExpectedSourceFPS()
-        if expectedSrc > 1, srcAvg < 0.75 * expectedSrc, autoReplans < 2 {
-            logLine("auto: 试档期间源帧率变成 \(Int(srcAvg))fps（这一档本该读到 \(Int(expectedSrc))fps，"
-                    + "规划源 \(Int(autoPlanSourceFPS))）→ 重新探测")
-            autoStatusText = "自动倍率：源帧率变了，重新探测…"
-            autoRelaunch(plan: [], step: 0, sourceFPS: 0, refresh: 0,
-                         reason: "源帧率变成 \(Int(srcAvg))fps", replans: autoReplans + 1)
-            return
-        }
-        if let reason = autoVerdict() {
-            let next = autoStep + 1
-            if autoPlan.indices.contains(next), autoPlan[next] >= autoMinMultiplier {
-                let target = autoPlan[next]
-                autoStatusText = "自动倍率：\(multiplier)× 不达标（\(reason)）→ 降到 \(target)×"
-                logLine("auto: 降档 \(multiplier)× → \(target)× 原因=\(reason) 样本=\(autoSamples.count)")
-                autoRelaunch(plan: autoPlan, step: next, sourceFPS: autoPlanSourceFPS,
-                             refresh: autoPlanRefresh > 1 ? autoPlanRefresh : enginePlanRefresh,
-                             reason: "\(multiplier)× 不达标：\(reason)")
-            } else {
-                autoSettled = true
-                autoStatusText = "自动倍率：已降到最低档 \(multiplier)×（\(reason)）"
-                logLine("auto: 阶梯走完，保持最低档 \(multiplier)×（原因=\(reason)）")
-            }
-            return
-        }
-        // 达标 ⇒ 定档
-        autoSettled = true
-        let lates = autoSamples.compactMap(\.lateRatio)
-        let avgLate = lates.isEmpty ? nil : lates.reduce(0, +) / Double(lates.count)
-        let outs = autoSamples.map(\.out)
-        let avgOut = outs.reduce(0, +) / Double(outs.count)
-        let lateTxt = avgLate.map { String(format: "抖动 %.1f%%", $0 * 100) } ?? "抖动未知"
-        autoStatusText = String(format: "自动倍率：已定 \(multiplier)×（源 %.0f → 出 %.0f fps · %@）",
-                                engineSrcFPS, avgOut, lateTxt)
-        let workers = autoSamples.compactMap(\.workerP95)
-        let workerTxt = workers.isEmpty ? "worker未知"
-            : String(format: "worker p95 %.1fms（仅记录不判定）", workers.max()!)
-        let dropTxt = "dropped=\(autoSamples.compactMap(\.dropped).reduce(0, +))"
-        logLine(String(format: "auto: 定档 %d× 样本=%d 源=%.0f 输出均值=%.0f %@ %@ %@",
-                       multiplier, autoSamples.count, engineSrcFPS, avgOut, lateTxt, workerTxt, dropTxt))
-    }
-
-    /// 定档后盯着源帧率：持续大幅偏离规划值 ⇒ 内容换了（24fps 视频切到 60fps 游戏之类），
-    /// 重新规划一次。门槛故意设得高（偏离 ≥40% 且连续 ≥20 秒、最多重规划 2 次）——
-    /// 每次重规划都要重启进程、画面闪一下，不能频繁打扰。
-    func autoCheckSourceDrift() {
-        let s = engineSrcFPS > 1 ? engineSrcFPS : (pipeline?.feedFPS ?? 0)
-        // 同口径比较：期望值也要先按当前倍率的采集上限钳一次（见 autoExpectedSourceFPS 的注释）
-        let expected = autoExpectedSourceFPS()
-        guard s > 1, expected > 1 else { return }
-        autoSmoothSrc = autoSmoothSrc == 0 ? s : autoSmoothSrc * 0.7 + s * 0.3
-        let drift = abs(autoSmoothSrc - expected) / expected
-        autoDriftSeconds = drift > 0.40 ? autoDriftSeconds + 1 : 0
-        guard autoDriftSeconds >= 20 else { return }
-        if autoReplans >= 2 {
-            if autoDriftSeconds == 20 {
-                logLine("auto: 源帧率变化（\(Int(autoSmoothSrc)) vs 这一档本该 \(Int(expected))），"
-                        + "但重规划次数已用尽 → 保持 \(multiplier)×")
-                autoStatusText = "自动倍率：源帧率变化较大，保持 \(multiplier)×（重规划次数已用尽）"
-            }
-            return
-        }
-        autoDriftSeconds = 0
-        logLine("auto: 源帧率持续偏离（\(Int(autoSmoothSrc)) vs 这一档本该 \(Int(expected))）→ 重新探测")
-        autoRelaunch(plan: [], step: 0, sourceFPS: 0, refresh: 0,
-                     reason: "源帧率变成 \(Int(autoSmoothSrc))fps", replans: autoReplans + 1)
-    }
+    var multiplierLabel: String { "\(multiplier)×" }
 
     // MARK: 每秒状态刷新
 
@@ -3784,7 +2946,6 @@ final class FirstMouseButton: NSButton {
         }
         parts.append(String(format: "屏 %.0fHz", refreshRate))
         if !offMode, let text = tailOfFile(engineLog) {
-            refreshEngineTelemetry(text)
             let line = text.components(separatedBy: "\n").last(where: { $0.contains("Frame generation stats") }) ?? ""
             if !line.isEmpty, line != lastEngineLine {
                 func count(_ name: String) -> Int {
@@ -3802,15 +2963,6 @@ final class FirstMouseButton: NSButton {
                     engineSrcFPS = engineRate
                     engineOutFPS = out
                     engineGenRatio = ratio
-                    // 自动倍率的观测样本：只在引擎**写出新统计行**时采。
-                    // 采不到样本 ⇒ 这一档判不了 ⇒ 判据一律返回「无法判断」（不动手），
-                    // 绝不把「读不到」当成「很好」。
-                    if autoEnabled, autoWindowStart > 0 {
-                        autoSamples.append(AutoSample(src: engineRate, out: out, genRatio: ratio,
-                                                      lateRatio: engineLateRatio,
-                                                      workerP95: engineWorkerP95,
-                                                      dropped: engineDroppedFrames))
-                    }
                 } else if generated > 0 {
                     parts.append("LSFG 已插入 \(generated) 帧")
                 }
@@ -3825,7 +2977,6 @@ final class FirstMouseButton: NSButton {
         if running, !paused, let p = pipeline, p.frameCount == 0, CACurrentMediaTime() - runningSince > 6 {
             parts.append("⚠️ 还没抓到帧（静态画面本来就不出帧；动态画面仍为 0 请反馈）")
         }
-        if autoEnabled, !autoStatusText.isEmpty { parts.append(autoStatusText) }
         let text = parts.joined(separator: " · ")
         statusLabel.stringValue = text
         if let badge, !badge.isHidden {
@@ -3864,13 +3015,12 @@ final class FirstMouseButton: NSButton {
         }
         // 菜单栏图标带状态（A = 自动倍率）：不用盯日志也知道现在几倍
         if let button = statusItem?.button {
-            let title = running ? "⚡\(offMode ? "原" : "\(multiplier)×")\(autoEnabled ? "A" : "")" : "⚡︎"
+            let title = running ? "⚡\(offMode ? "原" : "\(multiplier)×")" : "⚡︎"
             if button.title != title { button.title = title }
         }
         if let hud, hud.alphaValue > 0 { hudLabel.stringValue = text }
         // ⚠️ 自动倍率的判定放在最后：它可能触发 relaunch（进程退出），
         // 必须等本帧的界面刷新全部做完再动手。
-        if autoEnabled { autoMultiplierTick() }
     }
 
     // MARK: 窗口代理
