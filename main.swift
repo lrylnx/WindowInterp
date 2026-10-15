@@ -6,7 +6,6 @@ import AppKit
 import ApplicationServices
 import ScreenCaptureKit
 import Metal
-import MetalFX
 import QuartzCore
 import CoreImage
 import CoreMedia
@@ -16,7 +15,7 @@ import Carbon.HIToolbox   // 系统级全局热键（RegisterEventHotKey）
 
 /// 版本标识 —— 「功能不好使」排查第一步永远是问版本（红线），所以把它打进
 /// 启动日志和菜单栏菜单头部，谁都能报出自己跑的是哪一版。
-let appVersion = "1.4.0"
+let appVersion = "1.4.1"
 
 // MARK: - 引擎注入（与 LSFG 视频播放器同一套路）
 
@@ -517,7 +516,7 @@ enum SourceWindow {
     }
 }
 
-// MARK: - 输出重建（「档 1」）：把渲染链尾那道双线性缩放换掉
+// MARK: - 画质（后处理档）：目前只有锐化。别再往里加"放大档"，理由见 ReconstructMode
 
 /// 输出链尾用哪套重采样 / 锐化。
 ///
@@ -532,36 +531,32 @@ enum SourceWindow {
 enum ReconstructMode: String, CaseIterable {
     /// 现状：双线性直通。**默认值**，与 1.1.0 的行为逐像素一致。
     case off
-    /// 只把重采样器从双线性换成 Lanczos（纯 Core Image，不新增 GPU pass）。
-    case lanczos
-    /// Lanczos + CAS（对比度自适应锐化）。多一张中间纹理 + 一个片元 pass。
+    /// CAS（对比度自适应锐化）。多一张中间纹理 + 一个片元 pass。
+    ///
+    /// ⚠️ **这里只剩两档，而且别再往回加「Lanczos 重采样」和「MetalFX 空间放大」。**
+    ///
+    /// 原因：本工具的采集尺寸**恒等于**输出尺寸（= 源矩形 × 屏幕缩放因子，上限是面板物理像素），
+    /// 也就是画面**已经是 1:1 原生像素、根本没有放大空间**。而那两档都只在「输出 > 采集」时
+    /// 才会被走到 —— 这个前提**永远不成立** ⇒ 它们与「原始画质」**逐像素完全相同**，
+    /// 纯粹让 UI 多两个骗人的选项。v1.4.0 发出去后用户实测「完全没区别」才发现
+    /// （`dev/开发笔记.md` 第二十三轮，红线 119）。
+    ///
+    /// 只有 CAS 在 1:1 下也真的会改画面（纯锐化，不需要放大）。
+    /// 内部尺寸不匹配时（SCK 回帧与我们请求的差 1px）仍会走一次 Lanczos 做归一化，
+    /// 但那是**兜底**、不是用户可选的档。
     case cas
-    /// **MetalFX Spatial**（`MTLFXSpatialScaler`）：macOS 系统自带的**空间**超分。
-    ///
-    /// 为什么选它：MetalFX 有两个 scaler —— **Spatial 只要一张颜色纹理**，而
-    /// **Temporal 需要深度 + 运动矢量**。窗口采集拿到的是合成后的二维画面，给不出后两者
-    /// （见 `dev/FSR4-可行性-2026-10-16.md`：FSR4 正是卡在同一处，且是硬约束、不是工程量问题）。
-    /// 所以「空间那个」是这条路上唯一能用的 AI 级放大器，而苹果把它做进了系统、零第三方依赖。
-    ///
-    /// ⚠️ 只在**确实要放大**（输出 > 采集）且**宽高比一致**时生效；其余情况自动降级 Lanczos，
-    /// 理由见 `SpatialPass.prepare` 的注释。
-    case metalfx
 
     var title: String {
         switch self {
         case .off: return "关闭（双线性直通）"
-        case .lanczos: return "Lanczos 重采样（省电 · 只对付放大）"
-        case .cas: return "Lanczos + CAS 锐化（画质优先）"
-        case .metalfx: return "MetalFX 空间放大（系统超分 · 只要一张图）"
+        case .cas: return "对比度自适应锐化（CAS）"
         }
     }
     /// 状态栏/日志用的一行说明。
     var shortName: String {
         switch self {
         case .off: return "关"
-        case .lanczos: return "Lanczos"
         case .cas: return "CAS"
-        case .metalfx: return "MetalFX"
         }
     }
     /// 控制窗下拉里显示的名字。
@@ -573,9 +568,7 @@ enum ReconstructMode: String, CaseIterable {
     var uiTitle: String {
         switch self {
         case .off: return "原始画质"
-        case .lanczos: return "Lanczos 重采样"
-        case .cas: return "Lanczos + 自适应锐化"
-        case .metalfx: return "MetalFX 空间放大"
+        case .cas: return "自适应锐化"
         }
     }
 }
@@ -740,103 +733,6 @@ final class CASPass {
     """
 }
 
-/// **MetalFX Spatial**（`MTLFXSpatialScaler`）的封装 —— 苹果系统自带的**空间**超分。
-///
-/// 用途：把「低分辨率的采集画面」放大到「输出尺寸」（`--output-scale fill` 时是面板物理像素），
-/// 取代原来那道**隐式的 GPU 双线性**缩放。
-///
-/// 两条结构约束（与 `CASPass` 同源，都是踩过才定的，别随手改）：
-///   ① ⚠️ **最后一步写 drawable 的必须仍然是 Core Image，不能是这个 pass。**
-///      2026-10-12 实测：谁写 drawable 会**改变插帧引擎在呈现时的上下翻转行为**，
-///      于是生产路径上多翻/少翻一次、整个画面倒过来。所以这里的输出也只落在**中间纹理**上，
-///      由 CI 收尾。判据：`dev/orient-run.sh` + `dev/verify-metalfx.swift`。
-///   ② 按需分配 + 按尺寸复用纹理与 scaler —— **别每帧建**（`MTLFXSpatialScaler` 的构造不便宜）。
-///
-/// ⚠️ 已知软肋（苹果文档明说）：Spatial 要求输入**已抗锯齿、无噪点**。游戏/低清视频那种带锯齿的源
-/// 会被连同锯齿一起放大。别把它当成能无中生有细节的东西 —— 它换不掉「内容本身就糊」。
-final class SpatialPass {
-    private let device: MTLDevice
-    private var scaler: MTLFXSpatialScaler?
-    private var src: MTLTexture?
-    private var dst: MTLTexture?
-    /// 当前 scaler / 纹理对应的尺寸组合；只有它变了才重建。
-    private var key = ""
-    /// 失败原因，给调用方记一次日志（然后降级 Lanczos）。
-    private(set) var disabledReason: String?
-
-    var enabled: Bool { scaler != nil && src != nil && dst != nil }
-    var inputTexture: MTLTexture? { src }
-    var outputTexture: MTLTexture? { dst }
-
-    init(device: MTLDevice) { self.device = device }
-
-    /// 准备（或复用）一次放大：`input` = 采集尺寸，`output` = 输出尺寸。
-    ///
-    /// 返回 false 时调用方**降级到 Lanczos**。会在这些情况下拒绝：
-    ///   * 系统 / 该设备不支持这个组合（`makeSpatialScaler` 返回 nil）
-    ///   * **不是放大**（输出任一维 ≤ 输入）—— Spatial 是 upscaler，缩小该用 Lanczos
-    ///   * **宽高比不一致**：MetalFX 只做整体拉伸、不做「等比 + 居中留黑边」。
-    ///     硬用它会把画面拉变形 —— 那比糊更糟，所以宁可不做。
-    func prepare(inputWidth: Int, inputHeight: Int, outputWidth: Int, outputHeight: Int) -> Bool {
-        guard inputWidth > 0, inputHeight > 0, outputWidth > 0, outputHeight > 0 else {
-            disabledReason = "尺寸非法"; return false
-        }
-        guard outputWidth > inputWidth, outputHeight > inputHeight else {
-            disabledReason = "输出 \(outputWidth)x\(outputHeight) 未大于输入 \(inputWidth)x\(inputHeight)（Spatial 只做放大）"
-            return false
-        }
-        // 容差 0.5%：差一两个像素的取整可以接受，明显不同就降级。
-        let inAspect = Double(inputWidth) / Double(inputHeight)
-        let outAspect = Double(outputWidth) / Double(outputHeight)
-        guard abs(inAspect - outAspect) / outAspect <= 0.005 else {
-            disabledReason = String(format: "宽高比不一致（输入 %.4f vs 输出 %.4f）→ 改用 Lanczos 等比缩放", inAspect, outAspect)
-            return false
-        }
-        let want = "\(inputWidth)x\(inputHeight)->\(outputWidth)x\(outputHeight)"
-        if key == want, enabled { return true }
-
-        let desc = MTLFXSpatialScalerDescriptor()
-        desc.inputWidth = inputWidth
-        desc.inputHeight = inputHeight
-        desc.outputWidth = outputWidth
-        desc.outputHeight = outputHeight
-        desc.colorTextureFormat = .bgra8Unorm
-        desc.outputTextureFormat = .bgra8Unorm
-        // 全链路是 sRGB 8-bit ⇒ 感知编码。换成 .linear 会让中间调整体偏暗/偏亮。
-        desc.colorProcessingMode = .perceptual
-
-        guard let made = desc.makeSpatialScaler(device: device) else {
-            disabledReason = "makeSpatialScaler 返回 nil（系统或该设备不支持此组合）"
-            return false
-        }
-        guard let s = makeTexture(width: inputWidth, height: inputHeight),
-              let d = makeTexture(width: outputWidth, height: outputHeight) else {
-            disabledReason = "建不出中间纹理"; return false
-        }
-        scaler = made; src = s; dst = d; key = want
-        disabledReason = nil
-        return true
-    }
-
-    /// `src` → MetalFX → `dst`。必须与 CI 用**同一条 commandBuffer**。
-    func encode(commandBuffer: MTLCommandBuffer) {
-        guard let scaler, let src, let dst else { return }
-        scaler.colorTexture = src
-        scaler.outputTexture = dst
-        scaler.encode(commandBuffer: commandBuffer)
-    }
-
-    private func makeTexture(width: Int, height: Int) -> MTLTexture? {
-        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
-                                                         width: width, height: height, mipmapped: false)
-        // 与 CASPass 用同一套用法集合：CI 写它 / MetalFX 读它写它 / CI 再读回来。
-        // 少给一个可能静默失败（CI 会退回 CPU 路径，慢到看不出原因）。
-        d.usage = [.shaderRead, .renderTarget, .shaderWrite]
-        d.storageMode = .private
-        return device.makeTexture(descriptor: d)
-    }
-}
-
 // MARK: - 采集 + 渲染管线（非 MainActor，所有状态归 renderQueue / frameQueue）
 
 final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
@@ -907,11 +803,9 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
     private var casPass: CASPass?
     /// shader 编译失败过一次就不再重试（别每帧撞一次）。
     private var casUnavailable = false
-    /// MetalFX Spatial 档的 scaler 与中间纹理（只有 `.metalfx` 档会用）。
-    private var spatialPass: SpatialPass?
-    /// 同上：Spatial 建不出来（系统/设备不支持，或尺寸不合适）就不再重试。
-    /// ⚠️ 失败时**要记一次日志再降级** —— 静默降级会让「画质怎么没变化」永远查不出原因。
-    private var spatialUnavailable = false
+    /// 重采样兜底上次处理过的尺寸组合。**只在它变了时记一次日志** ——
+    /// "兜底悄悄在跑"正是最难查的那类问题（红线 119：要看得见分支有没有被走到）。
+    private var lastResampleKey = ""
     private let outputColorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
     // Bound submitted GPU work as well as the CPU mailbox. Drop stale input instead of queueing latency.
     private let inFlight = DispatchSemaphore(value: 2)
@@ -1092,35 +986,23 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         var normalized = image.transformed(by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY))
 
-        // ① 重采样。各档共用同一个入口，区别只在「用谁来放大」。
-        //    1:1 时整段跳过 —— Lanczos 在 1:1 下本来就是恒等变换，没必要白跑两遍。
+        // ① 重采样 —— **兜底路径，不是"画质档"**。
+        //    正常情况下采集尺寸**恒等于** drawable 尺寸（画面本来就是 1:1 原生像素），
+        //    所以这一段整段跳过；只有 SCK 回帧的尺寸和我们请求的差 ≥1px 时才归一化一次。
+        //    ⚠️ 别再把它当"放大档"搬回 UI：那需要「输出 > 采集」这个前提，而本工具
+        //    **永远没有**那个前提（见 `ReconstructMode` 的注释 / 红线 119）。
         let mode = reconstruct
-        let needScale = abs(normalized.extent.width - CGFloat(W)) > 0.5
+        let needResample = abs(normalized.extent.width - CGFloat(W)) > 0.5
             || abs(normalized.extent.height - CGFloat(H)) > 0.5
-
-        // ①-a MetalFX Spatial：**唯一不经过 Lanczos 的放大档**，这正是它存在的意义。
-        //      结构 CI → 采集尺寸纹理 → MetalFX → 输出尺寸纹理 → CI 收尾（与 CAS 档同构）。
-        //      准入由 SpatialPass.prepare 判定（必须真是放大 + 宽高比一致），不满足就降级。
-        var spatialSrc: MTLTexture?
-        var spatialDst: MTLTexture?
-        if mode == .metalfx, needScale, !thruMid, !spatialUnavailable {
-            let inW = Int(normalized.extent.width.rounded())
-            let inH = Int(normalized.extent.height.rounded())
-            if spatialPass == nil { spatialPass = SpatialPass(device: device) }
-            if let pass = spatialPass, pass.prepare(inputWidth: inW, inputHeight: inH,
-                                                    outputWidth: W, outputHeight: H) {
-                spatialSrc = pass.inputTexture
-                spatialDst = pass.outputTexture
-            } else {
-                // 失败一次就不再重试（别每帧撞一次），并且**要喊一声**。
-                spatialUnavailable = true
-                let why = spatialPass?.disabledReason ?? "拿不到中间纹理"
-                logLine("reconstruct: ⚠️ MetalFX Spatial 不可用（\(why)）→ 从这一帧起退回 Lanczos 档（不再重试）")
-            }
-        }
-
-        let needResample = mode != .off && spatialDst == nil && needScale
         if needResample {
+            // 这条兜底**不该**在正常运行时触发。真触发了就记一次（按尺寸去重，别刷屏）——
+            // 让人能看见它到底有没有被走到（红线 119）。
+            let key = "\(Int(normalized.extent.width))x\(Int(normalized.extent.height))->\(W)x\(H)"
+            if lastResampleKey != key {
+                lastResampleKey = key
+                logLine("reconstruct: 采集 \(Int(normalized.extent.width))x\(Int(normalized.extent.height)) "
+                        + "≠ drawable \(W)x\(H) → Lanczos 归一化（兜底路径）")
+            }
             // 等比缩放（非等比会被拉变形），再居中；空出来的边用黑底合上，
             // 否则未覆盖的纹素会留着上一帧的内容（表现为边缘花屏）。
             let s = min(CGFloat(W) / normalized.extent.width, CGFloat(H) / normalized.extent.height)
@@ -1164,29 +1046,10 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
         if wantMid {
             if casPass == nil { casPass = CASPass(device: device) }
         }
-        // ③-A MetalFX Spatial 路径 —— 与 CAS 档**同构**：
-        //       「第一跳把方向定好 → 中间一道 GPU pass → 最后一跳读回来直接写 drawable」。
-        //       唯一差别是中间那道由 MetalFX 做**放大**（而不是 CAS 做锐化）。
-        //       所以这里的翻转位置刻意与 CAS 档一致（在写 src 那一步翻），
-        //       最后一跳**不再变换** —— 这是 `dev/orient-run.sh` 那套约定，别随手挪。
-        if let srcTex = spatialSrc, let dstTex = spatialDst, let pass = spatialPass {
-            // ⚠️ 这一路**完全不做翻转** —— 与 CAS 档相反，只能靠实测定
-            //    （`dev/verify-metalfx.swift` 第 ③ 条，而且**两种 flipVertical 都要测**）。
-            //    实测结论：这条链「CI → 纹理 → MetalFX → 纹理 → CI → drawable」相对
-            //    「关闭」档**自带一次上下翻转**，恰好把引擎那一次抵消掉，于是两边都不用再翻：
-            //      flipVertical=true  / false 两种情况的方向断言都只有在「不翻」时才成立。
-            //    ⚠️ 按「与 CAS 档对称」（第一跳就翻）去推会得到**恰好相反**的结论，
-            //    整个画面会上下颠倒；只测一种 flipVertical 也会改错方向。
-            //    判据：`dev/verify-metalfx.swift` ③（含反向注入，证明它不在噪声里）。
-            context.render(normalized, to: srcTex, commandBuffer: command,
-                           bounds: CGRect(x: 0, y: 0, width: srcTex.width, height: srcTex.height),
-                           colorSpace: colorSpace)
-            pass.encode(commandBuffer: command)
-            if let outImage = CIImage(mtlTexture: dstTex, options: [.colorSpace: colorSpace]) {
-                context.render(outImage, to: drawable.texture, commandBuffer: command,
-                               bounds: bounds, colorSpace: colorSpace)
-            }
-        } else if wantMid, let pass = casPass, let bufs = pass.buffers(width: W, height: H) {
+        // ③-A 中间纹理路径（CAS / 诊断档 `--reconstruct-thru-mid`）：
+        //     「第一跳把方向定好 → 中间一道 GPU pass → 最后一跳读回来直接写 drawable」。
+        //     这条约定是 `dev/orient-run.sh` 实测定的，别随手挪。
+        if wantMid, let pass = casPass, let bufs = pass.buffers(width: W, height: H) {
             // ① CI 渲染（重采样 + 翻转）→ 中间纹理
             context.render(transformed, to: bufs.src, commandBuffer: command, bounds: bounds, colorSpace: colorSpace)
             // ② CAS（诊断档 `--reconstruct-thru-mid` 会跳过这一步）
@@ -1362,9 +1225,6 @@ final class FirstMouseButton: NSButton {
     var floatingControlsVisible = true
     var metalHUDEnabled = preferences.bool(forKey: "metalHUDEnabled")
     var metalHUDCheck = NSButton(checkboxWithTitle: "Metal HUD（帧率 / GPU 性能）", target: nil, action: nil)
-    /// 「按屏幕分辨率重建」—— 把 `--output-scale fill` 接到 UI。
-    /// 它属于**尺寸类**设置：改了要重建引擎（不像画质/锐化那样能热更），见 `outputScaleChanged`。
-    var outputScaleCheck = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     var pauseButton: FirstMouseButton!
     var stopButton: FirstMouseButton!
 
@@ -1451,10 +1311,6 @@ final class FirstMouseButton: NSButton {
     var appliedMultiplier = multiplier
     var appliedPerformance = performanceMode
     var appliedMode: CaptureMode = .window
-    /// 「已生效的」输出尺寸开关。**它必须参与 `scheduleEngineSwitch` 的比对** ——
-    /// 那个函数在「三项设置都没变」时会短路成"设置已生效"直接返回；
-    /// 漏掉这一项，改复选框就会**静默不生效**（界面看起来点了、其实什么都没发生）。
-    var appliedOutputScale = false
     /// CAS 强度 0…1（只有 `.cas` 档用到）。0 = 与关闭档逐像素一致（自检用）。
     var sharpenAmount: Float = {
         if let v = argument("--reconstruct-sharp"), let f = Float(v) { return min(max(f, 0), 1) }
@@ -1462,22 +1318,6 @@ final class FirstMouseButton: NSButton {
             return min(max(UserDefaults.standard.float(forKey: "reconstructSharp"), 0), 1)
         }
         return 0.5
-    }()
-    /// `--output-scale fill`：输出尺寸跟到**面板物理像素**，而不是「与采集尺寸相同」。
-    /// 它的存在只有一个目的：**把「输出尺寸 ≠ 采集尺寸」这条管线打通并验证**
-    /// （可行性报告 §6 第 1 步的验收项）——配合 `--resolution 720` 就能造出
-    /// 「采集 720p → 输出 1440p」这种确定性场景，量 Lanczos/CAS 与双线性的差别。
-    ///
-    /// ⚠️ 它**只改内部渲染分辨率，不改窗口 frame**：覆盖层仍然精确贴住源窗口，
-    /// 所以点击落点一点没变。这与「把画面放大铺满整屏」（档 3a/3b）是两回事。
-    /// ⚠️ 代价：输出变大 ⇒ 引擎的光流也跑在更大的 drawable 上，GPU 会上涨。
-    ///
-    /// 2026-10-16 起接到 UI（控制窗的「按屏幕分辨率重建」复选框）并写进偏好。
-    /// 优先级：**命令行 > 偏好 > 关**（与 `--reconstruct` 同一套口径）。
-    var outputScaleFill: Bool = {
-        if argument("--output-scale") == "fill" { return true }
-        if argument("--output-scale") == "same" { return false }
-        return UserDefaults.standard.bool(forKey: "outputScaleFill")
     }()
     /// **诊断档**：强制走「CI 渲染到中间纹理 → CI 再把中间纹理拷回 drawable」这条路
     /// （`reconstruct == .cas` 的结构，但**完全不碰 CAS 那个片元 shader**）。
@@ -1748,11 +1588,6 @@ final class FirstMouseButton: NSButton {
         metalHUDCheck.toolTip = "实时查看帧率、GPU 耗时等性能数据。"
         let switches = NSStackView(views: [perfModeCheck, badgeCheck, metalHUDCheck])
         switches.spacing = 22
-        outputScaleCheck.title = "按屏幕分辨率重建"
-        outputScaleCheck.target = self
-        outputScaleCheck.action = #selector(outputScaleChanged(_:))
-        outputScaleCheck.state = outputScaleFill ? .on : .off
-        outputScaleCheck.toolTip = "内部以屏幕物理分辨率渲染画面；覆盖层仍精确贴住源窗口、点击落点不变。只在「画质」选 MetalFX 且窗口比屏幕小时看得出效果。开启后引擎的光流开销会上升。"
         // ⚠️ 从 `allCases` 生成，**不要手写字符串数组** —— 手写数组与枚举一旦错位，
         //    `reconstructionChanged()` 会按下标选到**别的档**，界面上看起来"选了却没生效"。
         reconstructPopup.addItems(withTitles: ReconstructMode.allCases.map(\.uiTitle))
@@ -1769,9 +1604,9 @@ final class FirstMouseButton: NSButton {
         let qualityRow = NSStackView(views: [label("画质", size: 11), reconstructPopup, label("锐化", size: 11), sharpnessSlider])
         qualityRow.spacing = 10
         let note = label("设置自动生效 · 倍率/性能模式在后台切换 · 画质实时预览", size: 11, color: .secondaryLabelColor)
-        let switchesContent = vertical([switches, qualityRow, outputScaleCheck, note], spacing: 10)
+        let switchesContent = vertical([switches, qualityRow, note], spacing: 10)
         let switchesCard = card(switchesContent)
-        switchesCard.heightAnchor.constraint(equalToConstant: 146).isActive = true
+        switchesCard.heightAnchor.constraint(equalToConstant: 120).isActive = true
         switches.widthAnchor.constraint(equalTo: switchesContent.widthAnchor).isActive = true
         note.widthAnchor.constraint(equalTo: switchesContent.widthAnchor).isActive = true
 
@@ -1914,18 +1749,6 @@ final class FirstMouseButton: NSButton {
         pipeline?.reconstruct = reconstruct
         pipeline?.sharpenAmount = sharpenAmount
         sendLiveSettings()
-    }
-
-    /// 「按屏幕分辨率重建」复选框。
-    ///
-    /// ⚠️ 它走 `scheduleEngineSwitch()`（重建引擎），**不是** `sendLiveSettings()`：
-    /// 输出尺寸一变，drawable 尺寸和引擎的光流工作尺寸都跟着变 —— 那是**引擎级**参数，
-    /// 与倍率 / 抓取方式同类，不能像画质那样在运行中热更。
-    @objc func outputScaleChanged(_ sender: NSButton) {
-        outputScaleFill = sender.state == .on
-        preferences.set(outputScaleFill, forKey: "outputScaleFill")
-        logLine("quality: 输出尺寸 = \(outputScaleFill ? "屏幕物理像素" : "与采集相同")")
-        scheduleEngineSwitch()
     }
 
     // MARK: 窗口枚举
@@ -2097,31 +1920,23 @@ final class FirstMouseButton: NSButton {
                     sourceFrame = display.frame
                 }
 
-                // 尺寸由 plannedCaptureSize 统一决定：物理像素上限 + 用户选的工作分辨率
+                // 采集尺寸 = 渲染尺寸（**不再有"输出与采集解耦"这回事**：那套只对
+                // 「放大铺满屏幕」那档有意义，而本工具不做那档。见 `plannedCaptureSize`）。
                 let planned = self.plannedCaptureSize(for: sourceFrame)
-                var captureWidth = Int(planned.width)
-                var captureHeight = Int(planned.height)
-                captureWidth = max(64, captureWidth - captureWidth % 2)
-                captureHeight = max(64, captureHeight - captureHeight % 2)
+                let captureWidth = Int(planned.width)
+                let captureHeight = Int(planned.height)
                 let captureSize = CGSize(width: captureWidth, height: captureHeight)
-                // 输出尺寸与采集尺寸**解耦**（默认相等 ⇒ 与 1.1.0 完全一致）。
-                let outputSize = self.resolveOutputSize(for: sourceFrame, captureSize: captureSize)
                 let fps = self.effectiveCaptureFPS
-                logLine("start: 源 \(target.frame) → 采集 \(captureWidth)x\(captureHeight) @\(Int(fps))fps "
-                        + "(物理上限 \(self.physicalPixelSize(for: sourceFrame)) workRes=\(self.workResolution) autoFPS=\(self.autoMatchFPS))")
-                logLine("start: 输出 \(Int(outputSize.width))x\(Int(outputSize.height)) "
-                        + "重建档=\(self.reconstruct.rawValue) 强度=\(self.sharpenAmount) "
-                        + "outputScale=\(self.outputScaleFill ? "fill" : "1.0")")
+                logLine("start: 源 \(target.frame) → 采集=输出 \(captureWidth)x\(captureHeight) @\(Int(fps))fps "
+                        + "(物理上限 \(self.physicalPixelSize(for: sourceFrame)) autoFPS=\(self.autoMatchFPS))")
+                logLine("start: 重建档=\(self.reconstruct.rawValue) 强度=\(self.sharpenAmount)")
 
                 var outputTarget = target
                 outputTarget.frame = sourceFrame
                 self.openInterpWindow(target: outputTarget, captureSize: captureSize)
-                // 输出尺寸要覆盖掉 openInterpWindow 里按采集尺寸设的那份（drawableSize 是
-                // 输出窗口的属性，而窗口是在上面那一步才创建的，所以只能在这里补一次）。
-                self.applyOutputSize(outputSize)
 
                 let pipeline = CapturePipeline(device: self.device, metal: self.metal,
-                                               renderSize: outputSize,
+                                               renderSize: captureSize,
                                                flipVertical: self.displayFlip)
                 pipeline.queueDepth = self.captureQueueDepth
                 pipeline.reconstruct = self.reconstruct
@@ -2858,27 +2673,17 @@ final class FirstMouseButton: NSButton {
         applyCaptureSizeChange(f)
     }
 
-    /// 窗口尺寸变了：按同一套规则（物理像素上限 + 工作分辨率）重算采集/渲染尺寸。
+    /// 窗口尺寸变了：按同一套规则（物理像素上限）重算采集尺寸。**采集尺寸就是渲染尺寸**。
     func applyCaptureSizeChange(_ f: CGRect) {
         let planned = plannedCaptureSize(for: f)
         let w = Int(planned.width), h = Int(planned.height)
         selected?.frame = f
-        let out = resolveOutputSize(for: f, captureSize: CGSize(width: w, height: h))
-        metal?.drawableSize = out
+        metal?.drawableSize = planned
         video?.movieAspect = CGFloat(w) / CGFloat(h)
         video?.needsLayout = true
-        pipeline?.renderSize = out
+        pipeline?.renderSize = planned
         pipeline?.updateSize(width: w, height: h, captureFPS: effectiveCaptureFPS)
-        logLine("resize: \(Int(f.width))x\(Int(f.height)) → capture \(w)x\(h) 输出 \(Int(out.width))x\(Int(out.height))")
-    }
-
-    /// 把**输出尺寸**落到输出窗口上（drawable 的像素尺寸）。
-    /// 默认它等于采集尺寸 ⇒ 与 1.1.0 逐像素一致；`--output-scale fill` 时才不同。
-    func applyOutputSize(_ size: CGSize) {
-        metal?.drawableSize = size
-        pipeline?.renderSize = size
-        video?.movieAspect = size.width / size.height
-        video?.needsLayout = true
+        logLine("resize: \(Int(f.width))x\(Int(f.height)) → 采集=输出 \(w)x\(h)")
     }
 
     /// 5 秒一次的**兜底**（`periodicRefresh` 里调）。
@@ -2974,20 +2779,20 @@ final class FirstMouseButton: NSButton {
                       height: screen.frame.height * screen.backingScaleFactor)
     }
 
-    /// 源矩形 → 实际采集/渲染尺寸。两个约束同时生效：
-    ///   ① 不超过显示器物理像素（见 `physicalPixelSize`）；
-    ///   ② 用户选的工作分辨率上限（`workResolution > 0` 时按高度封顶）。
-    func plannedCaptureSize(for cgFrame: CGRect) -> CGSize {
-        evenSize(plannedOutputSize(for: cgFrame, respectWorkResolution: true))
-    }
-
-    /// 源矩形 → **输出尺寸**（drawable 的像素尺寸）。
+    /// 源矩形 → **采集尺寸 = 渲染尺寸**（drawable 的像素尺寸）。两者**恒等**，没有第二套概念。
     ///
-    /// 与 `plannedCaptureSize` 的区别只有一个：**不吃「工作分辨率」**。
-    /// 那个下拉是**采集端**的省电旋钮（压小采集 = 引擎工作量小），不该顺手把输出也压小。
-    /// 默认 `outputScaleFill == false` 时返回 `.zero`，由调用方用采集尺寸兜底
-    /// —— 这就是 1.1.0 的行为，一个像素都不变。
-    func plannedOutputSize(for cgFrame: CGRect, respectWorkResolution: Bool) -> CGSize {
+    /// ⚠️ 这里曾经还有个 `plannedOutputSize` / `resolveOutputSize`（"输出尺寸与采集解耦"），
+    /// 是给 `--output-scale fill` 用的。它唯一能起作用的场合是「刻意压低采集、再把画面
+    /// 放大回去」（= 小黄鸭那个 FSR 档的前提），而本工具**不做那档**（只保留贴源覆盖层，
+    /// 第十三轮定的），所以那套东西**永远不生效**、已在 2026-10-16 连同 MetalFX 档一起删掉
+    /// （见 `ReconstructMode` 的注释 / `dev/开发笔记.md` 第二十三轮 / 红线 119）。
+    ///
+    /// 两个约束同时生效：
+    ///   ① 不超过显示器物理像素（见 `physicalPixelSize`）—— 「更多空间」这类缩放模式下
+    ///      「逻辑点 ×2」比面板真实像素多 1.7 倍，不封顶就是让引擎白烧电；
+    ///   ② `workResolution > 0` 时按高度封顶（**当前是常量 0**：那个设置项已不提供，
+    ///      留着只是因为这正是当年"输出/采集解耦"的驱动源，写明白省得后人再摸一遍）。
+    func plannedCaptureSize(for cgFrame: CGRect) -> CGSize {
         let scale = scaleFactor(for: cgFrame)
         var w = cgFrame.width * scale
         var h = cgFrame.height * scale
@@ -2998,23 +2803,17 @@ final class FirstMouseButton: NSButton {
                 w *= k; h *= k
             }
         }
-        if respectWorkResolution, workResolution > 0 {
+        if workResolution > 0 {
             let k = min(1.0, Double(workResolution) / h)
             w *= k; h *= k
         }
-        return CGSize(width: w, height: h)
+        return evenSize(CGSize(width: w, height: h))
     }
 
     /// 长宽各向下取到偶数（视频/纹理管线对奇数尺寸不友好），并保证不小于 64。
     func evenSize(_ size: CGSize) -> CGSize {
         CGSize(width: max(64, (size.width / 2).rounded(.down) * 2),
                height: max(64, (size.height / 2).rounded(.down) * 2))
-    }
-
-    /// 这次运行真正要用的输出尺寸。
-    /// `--output-scale fill` 时跟到面板物理像素，否则**严格等于采集尺寸**（默认行为）。
-    func resolveOutputSize(for cgFrame: CGRect, captureSize: CGSize) -> CGSize {
-        outputScaleFill ? evenSize(plannedOutputSize(for: cgFrame, respectWorkResolution: false)) : captureSize
     }
 
     /// 实际使用的采集帧率上限。
@@ -3421,11 +3220,8 @@ extension AppDelegate {
         engineSwitchWork?.cancel()
         pendingTimeout?.cancel()
         pendingSession?.stop(); pendingSession = nil
-        // ⚠️ `outputScaleFill` 必须在这个比对里 —— 漏掉它，勾选「按屏幕分辨率重建」
-        // 会被这里判成"设置已生效"直接返回，**静默不生效**（点了像没反应，也查不出原因）。
         if let _ = engineSession, multiplier == appliedMultiplier,
-           performanceMode == appliedPerformance, mode == appliedMode,
-           outputScaleFill == appliedOutputScale {
+           performanceMode == appliedPerformance, mode == appliedMode {
             starting = false
             statusLabel.stringValue = "设置已生效"
             return
@@ -3451,19 +3247,16 @@ extension AppDelegate {
         let requestedMultiplier = multiplier
         let requestedPerformance = performanceMode
         let requestedMode = mode
-        let requestedOutputScale = outputScaleFill
         var args = ["--engine-worker", "--window-id", String(target.windowID), "--autostart",
                     "--multiplier", String(multiplier), "--mode", mode == .window ? "window" : "display",
                     performanceMode ? "--performance" : "--quality",
                     "--reconstruct", reconstruct.rawValue, "--reconstruct-sharp", String(sharpenAmount),
                     "--target-fps", String(targetFPS)]
-        // 明确传给子进程（而不是指望它自己去读偏好）—— 与 `--reconstruct` 同一套口径。
-        if outputScaleFill { args += ["--output-scale", "fill"] }
         if offMode { args.append("--off") }
         for flag in ["--test-window", "--native-fullscreen", "--ignore-pixel-cap", "--diagnostics",
                      "--reconstruct-thru-mid", "--solid", "--no-space-switch"] where hasFlag(flag) { args.append(flag) }
         for key in ["--test-x", "--test-y", "--test-w", "--test-h", "--queue-depth", "--drawable-count",
-                    "--overlay-alpha", "--output-scale", "--dump-output"] {
+                    "--overlay-alpha", "--dump-output"] {
             if let value = argument(key) { args += [key, value] }
         }
         for value in arguments(named: "--engine-env") { args += ["--engine-env", value] }
@@ -3490,7 +3283,6 @@ extension AppDelegate {
                         self.appliedMultiplier = requestedMultiplier
                         self.appliedPerformance = requestedPerformance
                         self.appliedMode = requestedMode
-                        self.appliedOutputScale = requestedOutputScale
                         self.workerOutputWindow = event["window"] as? Int ?? 0
                         self.running = true; self.starting = false
                         self.remoteFrames = 0; self.remoteDropped = 0; self.remoteFPS = 0; self.engineOutFPS = 0
@@ -3570,11 +3362,6 @@ extension AppDelegate {
             multiplierPopup.selectItem(at: supportedMultipliers.firstIndex(of: multiplier) ?? 0)
             perfModeCheck.state = performanceMode ? .on : .off
             modePopup.selectItem(at: mode.rawValue)
-            // ⚠️ 输出尺寸也要跟着回退 —— 否则复选框停在新值、实际跑的却还是旧值，
-            // 界面与行为不一致，而且下次再点它会被当成"没变"而不再触发切换。
-            outputScaleFill = appliedOutputScale
-            preferences.set(outputScaleFill, forKey: "outputScaleFill")
-            outputScaleCheck.state = outputScaleFill ? .on : .off
         }
         startButton.title = running ? "停止插帧" : "开始插帧"
         statusLabel.stringValue = "设置未应用：\(message)" + (running ? "；继续使用原引擎" : "")
