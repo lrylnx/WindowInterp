@@ -25,20 +25,26 @@ fi
 mkdir -p "$WORK"
 chmod 700 "$WORK"
 
-echo "→ 生成自签证书（codeSigning 用途，10 年有效）"
-openssl req -x509 -newkey rsa:2048 -nodes \
-    -keyout "$WORK/key.pem" -out "$WORK/cert.pem" -days 3650 \
-    -subj "/CN=$IDENTITY/O=Local Development/C=CN" \
-    -addext "keyUsage=critical,digitalSignature" \
-    -addext "extendedKeyUsage=critical,codeSigning" \
-    -addext "basicConstraints=critical,CA:FALSE" 2>/dev/null
+if [ "${1:-}" = "--force" ] || [ ! -s "$WORK/identity.p12" ]; then
+    echo "→ 生成自签证书（codeSigning 用途，10 年有效）"
+    openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "$WORK/key.pem" -out "$WORK/cert.pem" -days 3650 \
+        -subj "/CN=$IDENTITY/O=Local Development/C=CN" \
+        -addext "keyUsage=critical,digitalSignature" \
+        -addext "extendedKeyUsage=critical,codeSigning" \
+        -addext "basicConstraints=critical,CA:FALSE" 2>/dev/null
+    openssl pkcs12 -export -inkey "$WORK/key.pem" -in "$WORK/cert.pem" \
+        -out "$WORK/identity.p12" -name "$IDENTITY" -passout "pass:$KCPASS" 2>/dev/null
+else
+    echo "→ 恢复已有签名证书，保持重建前后的应用身份"
+fi
 
-openssl pkcs12 -export -inkey "$WORK/key.pem" -in "$WORK/cert.pem" \
-    -out "$WORK/identity.p12" -name "$IDENTITY" -passout "pass:$KCPASS" 2>/dev/null
-
-echo "→ 写入独立钥匙串 $KEYCHAIN"
-security delete-keychain "$KEYCHAIN" 2>/dev/null || true
-security create-keychain -p "$KCPASS" "$KEYCHAIN"
+if [ "${1:-}" = "--force" ] && [ -f "$KEYCHAIN" ]; then
+    security delete-keychain "$KEYCHAIN"
+fi
+if [ ! -f "$KEYCHAIN" ]; then
+    security create-keychain -p "$KCPASS" "$KEYCHAIN"
+fi
 security set-keychain-settings "$KEYCHAIN"
 security unlock-keychain -p "$KCPASS" "$KEYCHAIN"
 # -A：不限制调用方；-T 额外显式允许 codesign / security

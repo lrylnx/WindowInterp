@@ -1,15 +1,6 @@
-// 窗口插帧助手 — 给任意全屏窗口做 LSFG 插帧
-//
-// 原理：ScreenCaptureKit 抓取指定窗口 → Core Image/Metal 画进本进程自己的
-// CAMetalLayer → LSFG 引擎 hook 住该图层的 present，在相邻源帧之间生成中间帧
-// → 输出到一个**新的全屏窗口**（原生全屏 = 独立 Space，4 指左右滑动即可切换）。
-//
-// 与上一版（BrowserInterp）的关键差异：
-//   1. 抓的是**窗口**（SCContentFilter.desktopIndependentWindow），不是"整屏再裁剪"；
-//      源窗口不被本进程覆盖，不存在自我镜像/裁剪坐标漂移。
-//   2. 输出是**独立全屏窗口**，不是盖在源窗口上的悬浮层；
-//      因此没有"被遮挡 → 浏览器把视频节流到 1fps"的老问题。
-//   3. 窗口列表每次打开菜单/点刷新都重新枚举，跨空间窗口也能列出来。
+// 窗口插帧助手 — ScreenCaptureKit → Core Image / Metal → LSFG → 穿透覆盖层。
+// 控制界面常驻；只有后台引擎进程注入 LSFG。引擎参数变化时先预热替代进程，
+// 确认真实生成帧后交接画面；锐化、角标与 Metal HUD 通过私有管道实时更新。
 
 import AppKit
 import ApplicationServices
@@ -24,10 +15,11 @@ import Carbon.HIToolbox   // 系统级全局热键（RegisterEventHotKey）
 
 /// 版本标识 —— 「功能不好使」排查第一步永远是问版本（红线），所以把它打进
 /// 启动日志和菜单栏菜单头部，谁都能报出自己跑的是哪一版。
-let appVersion = "1.2.0"
+let appVersion = "1.3.0"
 
 // MARK: - 引擎注入（与 LSFG 视频播放器同一套路）
 
+signal(SIGPIPE, SIG_IGN)
 setvbuf(stdout, nil, _IONBF, 0)   // 自检时 stdout 走管道，不留缓冲
 setvbuf(stderr, nil, _IONBF, 0)
 
@@ -56,7 +48,7 @@ try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: 
 let engineLog = logs.appendingPathComponent("engine-\(getpid()).log")
 let appLogURL = logs.appendingPathComponent("app.log")
 
-// 每次启动（含改设置后的自动重启）都会写一个 engine-<pid>.log，久了会攒一堆。
+// 每个后台引擎都会写一个 engine-<pid>.log，保留最近一周。
 // 顺手清掉一周前的旧文件，免得日志目录无限膨胀。
 if let old = try? FileManager.default.contentsOfDirectory(at: logs,
                                                          includingPropertiesForKeys: [.contentModificationDateKey]) {
@@ -69,6 +61,8 @@ if let old = try? FileManager.default.contentsOfDirectory(at: logs,
 }
 
 let supportedMultipliers = [2, 3, 4, 5, 6, 8, 10, 12]
+let isEngineWorker = hasFlag("--engine-worker")
+let usesEngineWorker = !isEngineWorker && !hasFlag("--in-process")
 let offMode = hasFlag("--off")
 let savedMultiplier = preferences.integer(forKey: "multiplier")
 // ⚠️ 这里以前是「解析不了就静默回落偏好」——脚本里把 --multiplier 传成空串/写错时，
@@ -82,7 +76,7 @@ if let raw = rawMultiplier, Int(raw) == nil {
 let askedMultiplier = Int(rawMultiplier ?? "") ?? (supportedMultipliers.contains(savedMultiplier) ? savedMultiplier : 2)
 let manualMultiplier = supportedMultipliers.contains(askedMultiplier) ? askedMultiplier : 2
 
-let multiplier = offMode ? 1 : manualMultiplier
+var multiplier = offMode ? 1 : manualMultiplier
 
 // —— 引擎级省电开关（都是进程级环境变量，改了必须重启进程）——
 //
@@ -96,7 +90,7 @@ let multiplier = offMode ? 1 : manualMultiplier
 // 实测本工具 3× 插帧下 GPU 功耗 3.40 W → 0.99 W，**生成帧数一张不少**
 // （输出被 vblank 限住，省下的是纯算力）⇒ 笔记本上很值。默认关，界面上可勾。
 let flowScale = "1.0"
-let performanceMode = hasFlag("--performance") || preferences.bool(forKey: "performanceMode")
+var performanceMode = !hasFlag("--quality") && (hasFlag("--performance") || preferences.bool(forKey: "performanceMode"))
 // 目标帧率默认 = 屏幕刷新率：生成帧超过这个数屏幕上根本显示不出来，算了也白算。
 let targetFPS: Int = {
     if let v = argument("--target-fps"), let n = Int(v), n > 0 { return n }
@@ -106,8 +100,8 @@ let targetFPS: Int = {
     return Int(hz > 1 ? hz.rounded() : 60)
 }()
 
-// 引擎是进程级的：倍率/开关变了只能重启进程。
-if getenv("WINDOW_INTERP_BOOT") == nil {
+// 注入只发生在引擎进程；控制窗口不会随引擎参数变化而重启。
+if !usesEngineWorker && getenv("WINDOW_INTERP_BOOT") == nil {
     setenv("WINDOW_INTERP_BOOT", "1", 1)
     if !offMode {
         let engine = multiplier > 4 ? "liblsfg_extended.dylib" : "liblsfg_metal.dylib"
@@ -789,6 +783,15 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
     private var casPass: CASPass?
     /// shader 编译失败过一次就不再重试（别每帧撞一次）。
     private var casUnavailable = false
+    private let outputColorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+    // Bound submitted GPU work as well as the CPU mailbox. Drop stale input instead of queueing latency.
+    private let inFlight = DispatchSemaphore(value: 2)
+    var onFirstFrame: (() -> Void)?
+    private var firstFrameSent = false
+    @MainActor private var configuredSize = CGSize.zero
+    @MainActor private var configuredFPS: Double = 0
+    @MainActor private var pendingSizeUpdate: (width: Int, height: Int, fps: Double)?
+    @MainActor private var sizeUpdateTask: Task<Void, Never>?
     /// 诊断档：强制走「CI → 中间纹理 → CI → drawable」（跳过 CAS shader）。
     var thruMid = false
     /// SCStream 的缓冲深度：WindowServer 最多替我们压几帧还没被取走的画面。
@@ -807,7 +810,20 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
         super.init()
     }
 
-    func start(filter: SCContentFilter, targetWindowID: CGWindowID, width: Int, height: Int, captureFPS: Double) async throws {
+    @MainActor func start(filter: SCContentFilter, targetWindowID: CGWindowID, width: Int, height: Int, captureFPS: Double) async throws {
+        let config = makeConfiguration(width: width, height: height, captureFPS: captureFPS)
+        configuredSize = CGSize(width: width, height: height)
+        configuredFPS = captureFPS
+        let stream = SCStream(filter: filter, configuration: config, delegate: self)
+        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: frameQueue)
+        self.stream = stream
+        try await stream.startCapture()
+        let cancelled = lock.withLock { stopped }
+        if cancelled { try? await stream.stopCapture(); return }
+        startDiag(targetWindowID: targetWindowID)
+    }
+
+    private func makeConfiguration(width: Int, height: Int, captureFPS: Double) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
         config.width = width
         config.height = height
@@ -826,41 +842,36 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
         config.ignoreShadowsSingleWindow = true
         config.includeChildWindows = false
 
-        let stream = SCStream(filter: filter, configuration: config, delegate: self)
-        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: frameQueue)
-        self.stream = stream
-        try await stream.startCapture()
-        let cancelled = lock.withLock { stopped }
-        if cancelled { try? await stream.stopCapture(); return }
-        startDiag(targetWindowID: targetWindowID)
+        return config
     }
 
-    func stop() {
+    @MainActor func stop() {
+        sizeUpdateTask?.cancel(); sizeUpdateTask = nil; pendingSizeUpdate = nil
         lock.lock(); stopped = true; latest = nil; capturedImage = nil; lock.unlock()
         diagTimer?.cancel(); diagTimer = nil
         if let stream { Task { try? await stream.stopCapture() } }
         stream = nil
     }
 
-    func updateSize(width: Int, height: Int, captureFPS: Double) {
+    @MainActor func updateSize(width: Int, height: Int, captureFPS: Double) {
         guard let stream else { return }
-        let config = SCStreamConfiguration()
-        config.width = width
-        config.height = height
-        config.pixelFormat = kCVPixelFormatType_32BGRA
-        config.colorSpaceName = CGColorSpace.sRGB
-        config.showsCursor = false
-        config.queueDepth = queueDepth
-        config.scalesToFit = false
-        config.preservesAspectRatio = true
-        config.capturesAudio = false
-        // 之前这里硬编码 60：一旦用户把采集上限降到 30/24（或自动匹配算出来的值），
-        // 尺寸一变就被悄悄改回 60，跟界面上显示的不一致。
-        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(captureFPS))
-        config.captureResolution = .best
-        config.ignoreShadowsSingleWindow = true
-        config.includeChildWindows = false
-        Task { try? await stream.updateConfiguration(config) }
+        let size = CGSize(width: width, height: height)
+        guard size != configuredSize || captureFPS != configuredFPS || sizeUpdateTask != nil else { return }
+        pendingSizeUpdate = (width, height, captureFPS)
+        guard sizeUpdateTask == nil else { return }
+        sizeUpdateTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.sizeUpdateTask = nil }
+            while !Task.isCancelled, let update = self.pendingSizeUpdate {
+                self.pendingSizeUpdate = nil
+                let config = self.makeConfiguration(width: update.width, height: update.height, captureFPS: update.fps)
+                do {
+                    try await stream.updateConfiguration(config)
+                    self.configuredSize = CGSize(width: update.width, height: update.height)
+                    self.configuredFPS = update.fps
+                } catch { logLine("capture: updateConfiguration failed: \(error.localizedDescription)") }
+            }
+        }
     }
 
     // MARK: SCStreamOutput
@@ -882,7 +893,7 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
 
         // 诊断只需每秒两次；避免每帧锁定 IOSurface、迫使 CPU 读取 GPU 资源。
         let now = CACurrentMediaTime()
-        if now - lastLumaSampleTime >= 0.5 {
+        if hasFlag("--diagnostics"), now - lastLumaSampleTime >= 0.5 {
             lastLumaSampleTime = now
             let luma = sampleLuma(buffer)
             statLock.lock(); lastLuma = luma; statLock.unlock()
@@ -924,7 +935,16 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
     private var lastSizeMismatchKey = ""
 
     private func present(_ image: CIImage) {
+        guard inFlight.wait(timeout: .now()) == .success else {
+            lock.withLock { replacedFrames += 1 }
+            return
+        }
+        var submitted = false
+        defer { if !submitted { inFlight.signal() } }
         guard let drawable = metal.nextDrawable(), let command = commandQueue.makeCommandBuffer() else { return }
+        guard !lock.withLock({ stopped }) else { return }
+        let limiter = inFlight
+        command.addCompletedHandler { _ in limiter.signal() }
         lock.lock(); capturedImage = image; lock.unlock()
         let extent = image.extent
         // 输出尺寸以 **drawable 纹理的真实尺寸**为准（唯一真相）。
@@ -976,9 +996,9 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
         //    ⚠️ 最后一步**必须仍由 Core Image 写 drawable**：让引擎那边的呈现行为
         //    与「关闭」档完全一致（多翻/少翻一次 = 整个画面倒过来，实测踩过）。
         let bounds = CGRect(x: 0, y: 0, width: W, height: H)
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        let colorSpace = outputColorSpace
         var casSharp: Float = -1
-        if mode == .cas, !thruMid, !casUnavailable {
+        if mode == .cas, sharpenAmount > 0, !thruMid, !casUnavailable {
             if casPass == nil { casPass = CASPass(device: device) }
             if let pass = casPass, pass.enabled, pass.buffers(width: W, height: H) != nil {
                 casSharp = min(max(sharpenAmount, 0), 1)
@@ -1006,7 +1026,12 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
             context.render(transformed, to: drawable.texture, commandBuffer: command, bounds: bounds, colorSpace: colorSpace)
         }
         command.present(drawable)
+        submitted = true
         command.commit()
+        if !firstFrameSent {
+            firstFrameSent = true
+            onFirstFrame?()
+        }
 
         presentCount += 1
         lock.lock()
@@ -1129,7 +1154,7 @@ final class FirstMouseButton: NSButton {
 // MARK: - 应用
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
-    let device = MTLCreateSystemDefaultDevice()!
+    lazy var device = MTLCreateSystemDefaultDevice()!
 
     var statusItem: NSStatusItem!
     var controlWindow: NSWindow!
@@ -1227,7 +1252,28 @@ final class FirstMouseButton: NSButton {
     ///
     /// ⚠️ 解析失败**要喊一声**，别静默回落 —— 这条红线的教训来自 `--multiplier`：
     /// 脚本里写错值被静默吞掉，四轮对照全是废数据。
-    let reconstruct: ReconstructMode = .off
+    var reconstruct: ReconstructMode = {
+        ReconstructMode(rawValue: argument("--reconstruct") ?? preferences.string(forKey: "reconstruct") ?? "off") ?? .off
+    }()
+    var reconstructPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    var sharpnessSlider = NSSlider(value: 0.5, minValue: 0, maxValue: 1, target: nil, action: nil)
+    var engineSession: EngineSession?
+    var pendingSession: EngineSession?
+    var activeTarget: CaptureTarget?
+    var engineSwitchWork: DispatchWorkItem?
+    var workerOutputAlpha: CGFloat = 1
+    var workerActivated = false
+    var workerHasFrame = false
+    var workerReportedReady = false
+    var pendingTimeout: DispatchWorkItem?
+    var settingsError = ""
+    var workerOutputWindow = 0
+    var remoteFrames = 0
+    var remoteDropped = 0
+    var remoteFPS: Double = 0
+    var appliedMultiplier = multiplier
+    var appliedPerformance = performanceMode
+    var appliedMode: CaptureMode = .window
     /// CAS 强度 0…1（只有 `.cas` 档用到）。0 = 与关闭档逐像素一致（自检用）。
     var sharpenAmount: Float = {
         if let v = argument("--reconstruct-sharp"), let f = Float(v) { return min(max(f, 0), 1) }
@@ -1321,18 +1367,26 @@ final class FirstMouseButton: NSButton {
     // MARK: 生命周期
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        buildStatusItem()
-        registerHotkeys()
+        if !isEngineWorker { buildStatusItem(); registerHotkeys() }
+        if isEngineWorker || hasFlag("--control-stdin") {
+            readWorkerCommands { [weak self] command in
+                MainActor.assumeIsolated { self?.receiveWorkerCommand(command) }
+            }
+        }
         // 覆盖层的**实时跟随**：4Hz，只查源窗口一个 frame（便宜），
         // 拖动/缩放源窗口时覆盖层立刻贴上去。以前只有 5 秒一次的兜底，
         // 贴源覆盖层一旦通用所有场景，那个延迟就成了硬伤。
-        followTimer = Timer(timeInterval: 0.25, target: self, selector: #selector(followTick), userInfo: nil, repeats: true)
-        RunLoop.main.add(followTimer!, forMode: .common)
+        if !usesEngineWorker {
+            followTimer = Timer(timeInterval: 0.25, target: self, selector: #selector(followTick), userInfo: nil, repeats: true)
+            RunLoop.main.add(followTimer!, forMode: .common)
+        }
         statTimer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in MainActor.assumeIsolated { watchdog.tick(); self?.tickStatus() } }
         RunLoop.main.add(statTimer!, forMode: .common)
         // 每 5 秒检查运行中的源窗口；不做窗口列表的后台枚举。
-        refreshTimer = Timer(timeInterval: 5, target: self, selector: #selector(periodicRefresh), userInfo: nil, repeats: true)
-        RunLoop.main.add(refreshTimer!, forMode: .common)
+        if !usesEngineWorker {
+            refreshTimer = Timer(timeInterval: 5, target: self, selector: #selector(periodicRefresh), userInfo: nil, repeats: true)
+            RunLoop.main.add(refreshTimer!, forMode: .common)
+        }
         startWatchdog()
         logLine("launch v\(appVersion) pid=\(getpid()) multiplier=\(multiplier) off=\(offMode) args=\(arguments.dropFirst().joined(separator: " "))")
 
@@ -1356,8 +1410,7 @@ final class FirstMouseButton: NSButton {
             return
         }
 
-        buildControlWindow()
-        scheduleControlDump()
+        if !isEngineWorker { buildControlWindow(); scheduleControlDump() }
 
         if let idText = argument("--window-id"), let id = UInt32(idText) {
             Task {
@@ -1368,17 +1421,18 @@ final class FirstMouseButton: NSButton {
                 } else {
                     logLine("start: 找不到 window-id=\(id)")
                     print("TARGET_NOT_FOUND \(id)")
-                    if exitAfter > 0 { NSApplication.shared.terminate(nil) }
+                    if isEngineWorker { emitWorkerEvent(["event": "error", "message": "目标窗口已不存在，请刷新列表"]) }
+                    if exitAfter > 0 || isEngineWorker { NSApplication.shared.terminate(nil) }
                 }
             }
-        } else {
+        } else if !isEngineWorker {
             NSApplication.shared.activate(ignoringOtherApps: true)
             controlWindow.makeKeyAndOrderFront(nil)
         }
 
         if exitAfter > 0 {
             DispatchQueue.main.asyncAfter(deadline: .now() + exitAfter) {
-                print("TEST_DONE frames=\(self.pipeline?.frameCount ?? 0) dropped=\(self.pipeline?.droppedCount ?? 0) running=\(self.running)")
+                print("TEST_DONE frames=\(self.pipeline?.frameCount ?? self.remoteFrames) dropped=\(self.pipeline?.droppedCount ?? self.remoteDropped) running=\(self.running)")
                 print("IS_FULLSCREEN=\(self.interpWindow?.styleMask.contains(.fullScreen) ?? false) WINDOW=\(self.interpWindow?.frame ?? .zero) LAYER=\(self.metal?.frame ?? .zero)")
                 NSApplication.shared.terminate(nil)
             }
@@ -1404,6 +1458,7 @@ final class FirstMouseButton: NSButton {
 
         let root = NSView()
         root.wantsLayer = true
+        root.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
         controlWindow.contentView = root
 
         func label(_ text: String, size: CGFloat = 12, weight: NSFont.Weight = .regular,
@@ -1494,7 +1549,7 @@ final class FirstMouseButton: NSButton {
 
         perfModeCheck = NSButton(checkboxWithTitle: "性能模式", target: self, action: #selector(perfModeChanged(_:)))
         perfModeCheck.state = performanceMode ? .on : .off
-        perfModeCheck.toolTip = "使用轻量着色器降低 GPU 开销，画质略有让步；切换后自动重启并恢复插帧。"
+        perfModeCheck.toolTip = "使用轻量着色器降低 GPU 开销；后台切换引擎，控制窗口保持打开。"
         let badgeCheck = NSButton(checkboxWithTitle: "显示右上角插帧角标", target: self, action: #selector(badgeChanged))
         badgeCheck.state = showBadge ? .on : .off
         badgeCheck.toolTip = "鼠标静止 3 秒后隐藏，在输出区域移动后恢复。"
@@ -1505,10 +1560,23 @@ final class FirstMouseButton: NSButton {
         metalHUDCheck.toolTip = "实时查看帧率、GPU 耗时等性能数据。"
         let switches = NSStackView(views: [perfModeCheck, badgeCheck, metalHUDCheck])
         switches.spacing = 22
-        let note = label("悬浮控件在鼠标静止 3 秒后隐藏，移动后重新显示。", size: 11, color: .secondaryLabelColor)
-        let switchesContent = vertical([switches, note], spacing: 10)
+        reconstructPopup.addItems(withTitles: ["原始画质", "Lanczos 重采样", "Lanczos + 自适应锐化"])
+        reconstructPopup.selectItem(at: ReconstructMode.allCases.firstIndex(of: reconstruct) ?? 0)
+        reconstructPopup.target = self
+        reconstructPopup.action = #selector(reconstructionChanged)
+        sharpnessSlider.doubleValue = Double(sharpenAmount)
+        sharpnessSlider.target = self
+        sharpnessSlider.action = #selector(reconstructionChanged)
+        sharpnessSlider.isContinuous = true
+        sharpnessSlider.isEnabled = reconstruct == .cas
+        sharpnessSlider.toolTip = "锐化强度 0–100%，实时预览；过高可能放大噪点。"
+        sharpnessSlider.widthAnchor.constraint(equalToConstant: 120).isActive = true
+        let qualityRow = NSStackView(views: [label("画质", size: 11), reconstructPopup, label("锐化", size: 11), sharpnessSlider])
+        qualityRow.spacing = 10
+        let note = label("设置自动生效 · 倍率/性能模式在后台切换 · 画质实时预览", size: 11, color: .secondaryLabelColor)
+        let switchesContent = vertical([switches, qualityRow, note], spacing: 10)
         let switchesCard = card(switchesContent)
-        switchesCard.heightAnchor.constraint(equalToConstant: 82).isActive = true
+        switchesCard.heightAnchor.constraint(equalToConstant: 120).isActive = true
         switches.widthAnchor.constraint(equalTo: switchesContent.widthAnchor).isActive = true
         note.widthAnchor.constraint(equalTo: switchesContent.widthAnchor).isActive = true
 
@@ -1618,7 +1686,7 @@ final class FirstMouseButton: NSButton {
                 + "或重新点一次「开始插帧」"
         }
     }
-    @objc func badgeChanged(_ sender: NSButton) { showBadge.toggle(); preferences.set(showBadge, forKey: "showBadge"); badge?.isHidden = !showBadge || !floatingControlsVisible; if showBadge { flashHUD() } }
+    @objc func badgeChanged(_ sender: NSButton) { showBadge.toggle(); preferences.set(showBadge, forKey: "showBadge"); badge?.isHidden = !showBadge || !floatingControlsVisible; if showBadge { flashHUD() }; sendLiveSettings() }
 
     @objc func multiplierChanged() {
         let index = multiplierPopup.indexOfSelectedItem
@@ -1626,26 +1694,47 @@ final class FirstMouseButton: NSButton {
         let chosen = supportedMultipliers[index]
         guard chosen != multiplier else { return }
         preferences.set(chosen, forKey: "multiplier")
-        relaunch(multiplier: chosen, autostart: running, seekTarget: selected?.windowID)
+        applyEngineSettings(multiplier: chosen)
     }
 
     @objc func modeChanged() {
         mode = CaptureMode(rawValue: modePopup.indexOfSelectedItem) ?? .window
         preferences.set(mode.rawValue, forKey: "mode")
-        hintLabel.stringValue = mode == .window ? "抓单个窗口的内容（源窗口在别的空间也能抓）" : "抓整块屏幕并排除本工具自己的窗口"
+        scheduleEngineSwitch()
     }
     @objc func perfModeChanged(_ sender: NSButton) {
-        let on = sender.state == .on
-        preferences.set(on, forKey: "performanceMode")
-        hintLabel.stringValue = on
-            ? "性能模式已开：引擎换轻量着色器（实测 GPU 功耗降到约 1/3、帧数不变），正在重启以生效…"
-            : "性能模式已关：回到画质优先的着色器，正在重启以生效…"
-        relaunch(multiplier: multiplier, autostart: running, seekTarget: selected?.windowID)
+        performanceMode = sender.state == .on
+        preferences.set(performanceMode, forKey: "performanceMode")
+        scheduleEngineSwitch()
+    }
+
+    @objc func reconstructionChanged() {
+        let index = reconstructPopup.indexOfSelectedItem
+        guard ReconstructMode.allCases.indices.contains(index) else { return }
+        reconstruct = ReconstructMode.allCases[index]
+        sharpenAmount = Float(sharpnessSlider.doubleValue)
+        sharpnessSlider.isEnabled = reconstruct == .cas
+        preferences.set(reconstruct.rawValue, forKey: "reconstruct")
+        preferences.set(sharpenAmount, forKey: "reconstructSharp")
+        pipeline?.reconstruct = reconstruct
+        pipeline?.sharpenAmount = sharpenAmount
+        sendLiveSettings()
     }
 
     // MARK: 窗口枚举
 
     func refreshTargets() async {
+        // Public screenshots use explicit demo data and never enumerate personal window titles.
+        if hasFlag("--demo-targets") {
+            targets = [
+                CaptureTarget(windowID: 1, pid: 0, appName: "Safari", title: "视频播放", frame: CGRect(x: 0, y: 0, width: 1920, height: 1080), onscreen: true, area: 2073600, looksFullscreen: true),
+                CaptureTarget(windowID: 2, pid: 0, appName: "IINA", title: "示例视频.mp4", frame: CGRect(x: 0, y: 0, width: 1280, height: 720), onscreen: true, area: 921600, looksFullscreen: false),
+                CaptureTarget(windowID: 3, pid: 0, appName: "游戏", title: "窗口化游戏", frame: CGRect(x: 0, y: 0, width: 1600, height: 900), onscreen: true, area: 1440000, looksFullscreen: false)
+            ]
+            rebuildList()
+            hintLabel.stringValue = "演示窗口列表 · 修改设置自动生效"
+            return
+        }
         // 同一时刻只跑一次枚举；后来的调用等它跑完再返回（否则会出现
         // "并发调用 → 第二个直接早退 → 拿到空列表" 的假象）
         if let existing = enumerateInFlight {
@@ -1730,7 +1819,7 @@ final class FirstMouseButton: NSButton {
             startButton.isEnabled = selected != nil || running || starting
         }
         if let selected, let row = targets.firstIndex(where: { $0.windowID == selected.windowID }) {
-            table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            table?.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         }
         startButton.title = starting ? "取消启动" : (running ? "停止插帧" : "开始插帧")
     }
@@ -1741,7 +1830,7 @@ final class FirstMouseButton: NSButton {
         startButton.isEnabled = true
         startButton.title = starting ? "取消启动" : (running ? "停止插帧" : "开始插帧")
         if let row = targets.firstIndex(where: { $0.windowID == target.windowID }) {
-            table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            table?.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         }
     }
 
@@ -1750,12 +1839,14 @@ final class FirstMouseButton: NSButton {
     @objc func startStopClicked() { (running || starting) ? stopInterpolation() : startInterpolation() }
 
     func startInterpolation(resuming: Bool = false) {
+        if usesEngineWorker { startEngineSession(); return }
         guard !starting, (!running || resuming) else { return }
         guard let target = selected else { logLine("start: 没有选中窗口"); return }
         logLine("start: 请求 target=\(target.windowID) \(target.appName) mode=\(mode) fps=\(captureFPS)")
         guard CGPreflightScreenCaptureAccess() else {
             CGRequestScreenCaptureAccess()
             statusLabel.stringValue = "需要屏幕录制权限，授权后请重新打开本应用"
+            if isEngineWorker { emitWorkerEvent(["event": "error", "message": statusLabel.stringValue]) }
             return
         }
         // 这里**不再**索要辅助功能权限了。上一版是为了「把浏览器原生全屏的源窗口请出
@@ -1768,7 +1859,7 @@ final class FirstMouseButton: NSButton {
         startButton.title = "取消启动"
         statusLabel.stringValue = "正在准备采集 \(target.display)…"
 
-        Task {
+        Task { [self] in
             defer {
                 if self.startGeneration == generation {
                     self.starting = false
@@ -1793,8 +1884,8 @@ final class FirstMouseButton: NSButton {
                         self.statusLabel.stringValue = "找不到目标所在的显示器"
                         return
                     }
-                    let myApp = content.applications.first { $0.bundleIdentifier == Bundle.main.bundleIdentifier }
-                    filter = SCContentFilter(display: display, excludingApplications: myApp.map { [$0] } ?? [], exceptingWindows: [])
+                    let ownApps = content.applications.filter { $0.bundleIdentifier == Bundle.main.bundleIdentifier }
+                    filter = SCContentFilter(display: display, excludingApplications: ownApps, exceptingWindows: [])
                     // 整屏捕获按「这块显示器」算尺寸，而不是按那个窗口的 frame
                     sourceFrame = display.frame
                 }
@@ -1815,7 +1906,9 @@ final class FirstMouseButton: NSButton {
                         + "重建档=\(self.reconstruct.rawValue) 强度=\(self.sharpenAmount) "
                         + "outputScale=\(self.outputScaleFill ? "fill" : "1.0")")
 
-                self.openInterpWindow(target: target, captureSize: captureSize)
+                var outputTarget = target
+                outputTarget.frame = sourceFrame
+                self.openInterpWindow(target: outputTarget, captureSize: captureSize)
                 // 输出尺寸要覆盖掉 openInterpWindow 里按采集尺寸设的那份（drawableSize 是
                 // 输出窗口的属性，而窗口是在上面那一步才创建的，所以只能在这里补一次）。
                 self.applyOutputSize(outputSize)
@@ -1830,9 +1923,17 @@ final class FirstMouseButton: NSButton {
                 pipeline.onFatal = { [weak self] message in
                     Task { @MainActor in
                         guard let self, self.startGeneration == generation else { return }
+                        if isEngineWorker { emitWorkerEvent(["event": "error", "message": message]) }
                         self.stopInterpolation()
                         self.statusLabel.stringValue = "⚠️ \(message)"
                         logLine("fatal: \(message)")
+                    }
+                }
+                pipeline.onFirstFrame = { [weak self] in
+                    DispatchQueue.main.async {
+                        guard let self, self.startGeneration == generation, isEngineWorker else { return }
+                        self.workerHasFrame = true
+                        self.reportWorkerReadiness()
                     }
                 }
                 self.pipeline = pipeline
@@ -1871,12 +1972,21 @@ final class FirstMouseButton: NSButton {
                 guard self.startGeneration == generation else { return }
                 self.stopInterpolation()
                 self.statusLabel.stringValue = "启动失败：\(error.localizedDescription)"
+                if isEngineWorker { emitWorkerEvent(["event": "error", "message": self.statusLabel.stringValue]) }
                 logLine("start: failed \(error.localizedDescription)")
             }
         }
     }
 
     func stopInterpolation() {
+        if usesEngineWorker {
+            engineSwitchWork?.cancel(); engineSwitchWork = nil
+            pendingTimeout?.cancel(); pendingTimeout = nil
+            pendingSession?.stop(); pendingSession = nil
+            engineSession?.stop(); engineSession = nil
+            activeTarget = nil
+        }
+        if isEngineWorker { emitWorkerEvent(["event": "stopped"]) }
         startGeneration += 1
         starting = false
         pipeline?.stop()
@@ -1932,6 +2042,7 @@ final class FirstMouseButton: NSButton {
             w.collectionBehavior.insert(.fullScreenPrimary)
             w.acceptsMouseMovedEvents = true
             w.backgroundColor = .black
+            if isEngineWorker { w.alphaValue = 0.01 }
             let root = NSView(); root.wantsLayer = true; root.layer?.backgroundColor = NSColor.black.cgColor
             w.contentView = root
 
@@ -2016,14 +2127,17 @@ final class FirstMouseButton: NSButton {
                 // isOpaque → alphaValue → metal.isOpaque → video.layer.isOpaque
                 interpWindow.isOpaque = false
                 let a = Double(argument("--overlay-alpha") ?? "") ?? 0.999
-                interpWindow.alphaValue = CGFloat(a)
+                workerOutputAlpha = CGFloat(a)
+                interpWindow.alphaValue = isEngineWorker && !workerActivated ? 0.01 : CGFloat(a)
                 metal.isOpaque = false
                 video.layer?.isOpaque = false
             }
             interpWindow.acceptsMouseMovedEvents = true
 
             // ① 先把覆盖层显示出来（此时还在用户当前那个 Space）。
-            interpWindow.orderFrontRegardless()
+            if let below = argument("--below-window"), let number = Int(below) {
+                interpWindow.order(.below, relativeTo: number)
+            } else { interpWindow.orderFrontRegardless() }
 
             let ownID = CGWindowID(interpWindow.windowNumber)
             let srcID = CGWindowID(target.windowID)
@@ -2039,7 +2153,7 @@ final class FirstMouseButton: NSButton {
             //    `CGSCopySpacesForWindows` 取 Space（见 SpacePrivate.revealSpace）。
             //    切不动才退而求其次：用 SkyLight 私有 API 把窗口显式搬进去（实测这条路
             //    在原生全屏 Space 上常返回 kCGErrorFailure，只当兜底，不当主路径）。
-            let switched = hasFlag("--no-space-switch") ? false : SpacePrivate.revealSpace(ofWindow: srcID)
+            let switched = (hasFlag("--no-space-switch") || hasFlag("--warm-switch")) ? false : SpacePrivate.revealSpace(ofWindow: srcID)
             var moved: Int32 = -1
             if !switched {
                 for s in srcSpaces where s > 0 {
@@ -2059,13 +2173,13 @@ final class FirstMouseButton: NSButton {
             //    键盘事件 —— 让事件「根本不经过我们」才是正解。
             interpWindow.ignoresMouseEvents = true
             hud.isHidden = true     // HUD 按钮在穿透窗口上点不了，亮出来只会误导
-            showGameHUD(overlayFrame: interpWindow.frame)
+            if !isEngineWorker { showGameHUD(overlayFrame: interpWindow.frame) }
             logLine("output: 输入穿透已开启 ignoresMouseEvents=true "
                     + "覆盖层=\(interpWindow.frame) 源=\(target.frame) "
                     + "appActive=\(NSApplication.shared.isActive)")
             // 用户可能是点了控制窗的「开始」才到这里的 —— 那一下会把本 App 拉成前台，
             // 源窗口会丢 key。把前台还给源 App（点菜单栏/热键启动的则本来就没抢过）。
-            if let srcApp = NSRunningApplication(processIdentifier: target.pid) {
+            if !hasFlag("--warm-switch"), let srcApp = NSRunningApplication(processIdentifier: target.pid) {
                 let ok = srcApp.activate()
                 logLine("output: 前台交还 pid=\(target.pid) ok=\(ok)")
             }
@@ -2092,7 +2206,9 @@ final class FirstMouseButton: NSButton {
             interpWindow.styleMask = [.titled]
             interpWindow.collectionBehavior = []
             interpWindow.setFrame(NSRect(x: tx, y: ty, width: tw, height: th), display: true)
-            interpWindow.orderFrontRegardless()
+            if let below = argument("--below-window"), let number = Int(below) {
+                interpWindow.order(.below, relativeTo: number)
+            } else { interpWindow.orderFrontRegardless() }
             print("INTERP_WINDOW_ID=\(interpWindow.windowNumber) capture=\(Int(captureSize.width))x\(Int(captureSize.height))")
             scheduleDump()
             return
@@ -2124,26 +2240,15 @@ final class FirstMouseButton: NSButton {
             guard let self, let num = self.controlWindow?.windowNumber, num != 0 else {
                 print("CONTROL_DUMP_FAILED 没有控制窗"); return
             }
-            Task { @MainActor in
-                do {
-                    let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                    guard let mine = content.windows.first(where: { $0.windowID == CGWindowID(num) }) else {
-                        print("CONTROL_DUMP_FAILED 找不到窗口 \(num)"); return
-                    }
-                    let filter = SCContentFilter(desktopIndependentWindow: mine)
-                    let cfg = SCStreamConfiguration()
-                    let scale = self.scaleFactor(for: mine.frame)
-                    cfg.width = Int(mine.frame.width * scale)
-                    cfg.height = Int(mine.frame.height * scale)
-                    cfg.ignoreShadowsSingleWindow = true
-                    let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
-                    let rep = NSBitmapImageRep(cgImage: image)
-                    try rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: prefix + ".png"))
-                    print("CONTROL_DUMP_DONE \(prefix).png \(image.width)x\(image.height)")
-                } catch {
-                    print("CONTROL_DUMP_FAILED \(error.localizedDescription)")
-                }
+            guard let view = self.controlWindow?.contentView,
+                  let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
+                print("CONTROL_DUMP_FAILED 无法绘制控制窗"); return
             }
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            do {
+                try bitmap.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: prefix + ".png"))
+                print("CONTROL_DUMP_DONE \(prefix).png \(bitmap.pixelsWide)x\(bitmap.pixelsHigh)")
+            } catch { print("CONTROL_DUMP_FAILED \(error.localizedDescription)") }
         }
     }
 
@@ -2274,8 +2379,14 @@ final class FirstMouseButton: NSButton {
     /// 用户随时按「继续」或在画面上点一下恢复。不退出、不动源窗口。
     func setPaused(_ value: Bool) {
         guard running else { return }
+        if usesEngineWorker {
+            paused = value
+            engineSession?.send(["command": "pause", "value": value])
+            rebuildStatusMenu()
+            return
+        }
         paused = value
-        pauseButton.title = value ? "继续" : "暂停"
+        pauseButton?.title = value ? "继续" : "暂停"
         gameHUDPause?.title = value ? "▶ 继续" : "⏸ 暂停"
         if value {
             pipeline?.stop()
@@ -2299,6 +2410,7 @@ final class FirstMouseButton: NSButton {
         preferences.set(metalHUDEnabled, forKey: "metalHUDEnabled")
         metalHUDCheck.state = metalHUDEnabled ? .on : .off
         applyMetalHUD()
+        sendLiveSettings()
         rebuildStatusMenu()
     }
 
@@ -2384,6 +2496,7 @@ final class FirstMouseButton: NSButton {
     }
 
     @objc func showControl() {
+        if isEngineWorker { emitWorkerEvent(["event": "showControl"]); return }
         if controlWindow == nil { buildControlWindow() }
         if controlWindow.isMiniaturized { controlWindow.deminiaturize(nil) }
         NSApplication.shared.activate(ignoringOtherApps: true)
@@ -2501,7 +2614,7 @@ final class FirstMouseButton: NSButton {
     func followOverlayFrame() {
         // ⚠️ overlayActive 那一项不能少：`--test-window` 的输出窗必须停在指定位置，
         // 被跟着拖到源窗口上会让延迟测量静默归零。理由见 overlayActive 的声明处。
-        guard overlayActive, running, !paused, interpTargetID != 0 else { return }
+        guard mode == .window, overlayActive, running, !paused, interpTargetID != 0 else { return }
         guard let iw = interpWindow, iw.isVisible else { return }
         guard let f = windowFrameFromCGWindowList(interpTargetID) else { return }
         // 垃圾帧守卫：窗口列表偶发会给出一个**不在任何屏幕内**的 frame
@@ -2768,9 +2881,8 @@ final class FirstMouseButton: NSButton {
         let on = !performanceMode
         preferences.set(on, forKey: "performanceMode")
         perfModeCheck.state = on ? .on : .off
-        statusLabel.stringValue = on ? "性能模式已开（轻量着色器）：正在重启以生效…"
-                                     : "性能模式已关：正在重启以生效…"
-        relaunch(multiplier: multiplier, autostart: running, seekTarget: selected?.windowID)
+        performanceMode = on
+        scheduleEngineSwitch()
     }
 
     // MARK: 状态栏 / 快捷键
@@ -2792,7 +2904,7 @@ final class FirstMouseButton: NSButton {
     }
 
     func rebuildStatusMenu() {
-        guard let menu = statusItem.menu else { return }
+        guard let menu = statusItem?.menu else { return }
         menu.removeAllItems()
         @discardableResult
         func add(_ title: String, _ action: Selector?, checked: Bool? = nil) -> NSMenuItem {
@@ -2868,18 +2980,19 @@ final class FirstMouseButton: NSButton {
         NSApplication.shared.activate(ignoringOtherApps: true)
         w.makeKeyAndOrderFront(nil)
     }
-    @objc func toggleBadge() { showBadge.toggle(); preferences.set(showBadge, forKey: "showBadge"); badge?.isHidden = !showBadge || !floatingControlsVisible; if showBadge { flashHUD() } }
+    @objc func toggleBadge() { showBadge.toggle(); preferences.set(showBadge, forKey: "showBadge"); badge?.isHidden = !showBadge || !floatingControlsVisible; if showBadge { flashHUD() }; sendLiveSettings() }
 
     @objc func menuMultiplier(_ sender: NSMenuItem) {
         guard let n = sender.representedObject as? NSNumber else { return }
         preferences.set(n.intValue, forKey: "multiplier")
-        relaunch(multiplier: n.intValue, autostart: running, seekTarget: selected?.windowID)
+        applyEngineSettings(multiplier: n.intValue)
     }
     @objc func menuMode(_ sender: NSMenuItem) {
         guard let n = sender.representedObject as? NSNumber else { return }
         mode = CaptureMode(rawValue: n.intValue) ?? .window
         preferences.set(mode.rawValue, forKey: "mode")
         modePopup.selectItem(at: mode.rawValue)
+        scheduleEngineSwitch()
     }
 
     func registerHotkeys() {
@@ -2891,52 +3004,20 @@ final class FirstMouseButton: NSButton {
         SystemHotkeys.register(key: "q") { NSApplication.shared.terminate(nil) }
     }
 
-    // MARK: 重启进程（倍率/开关是引擎环境变量，改不了只能重启）
-
-    func relaunch(multiplier m: Int, autostart: Bool, seekTarget: CGWindowID?, forceOff: Bool = false) {
-        stopInterpolation()
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: arguments[0])
-        var args: [String] = []
-        if forceOff || offMode { args.append("--off") }
-        args += ["--multiplier", String(m)]
-        // 输出方式已经没有开关了（贴源覆盖层是唯一方式），所以这里不再转发 `--game-mode`。
-        // 性能模式由新进程读取已保存偏好，不能转发旧进程的启动值。
-        if mode == .display { args += ["--mode", "display"] }
-        // 诊断用的引擎开关透传也要跟着走，否则改一次倍率就把探测配置丢了
-        for kv in arguments(named: "--engine-env") { args += ["--engine-env", kv] }
-        // 自检/测量布置也要跟着走 —— 自动换档一次就把它们丢了的话，本来在 620×400
-        // 小窗里跑的自检会突然变成全屏覆盖层，整条测量链就废了（踩过这种）。
-        // ⚠️ 故意**不转发** `--test-seconds`：那会让每一档都重新计时，总时长失控。
-        for flag in ["--test-window",
-                     "--native-fullscreen", "--ignore-pixel-cap"] where hasFlag(flag) {
-            args.append(flag)
-        }
-        // ⚠️ 故意**不转发** `--reconstruct` / `--reconstruct-sharp`：它们的唯一真相是
-        // UserDefaults（改设置时就写好了），新进程自己会读。命令行优先级更高，
-        // 转发过去反而会把用户刚改的值按回旧值（`--flow-scale` 就是这么踩的）。
-        // `--output-scale` 是纯诊断开关、不持久化，所以要跟着走。
-        if outputScaleFill { args += ["--output-scale", "fill"] }
-        for key in ["--test-x", "--test-y", "--test-w", "--test-h",
-                    "--queue-depth", "--drawable-count"] {
-            if let v = argument(key) { args += [key, v] }
-        }
-        if let seekTarget { args += ["--window-id", String(seekTarget)]; if autostart { args.append("--autostart") } }
-        process.arguments = args
-        var env = ProcessInfo.processInfo.environment
-        for name in Array(env.keys) where name.hasPrefix("LSFGM_") || name == "DYLD_INSERT_LIBRARIES" || name == "WINDOW_INTERP_BOOT" {
-            env.removeValue(forKey: name)
-        }
-        process.environment = env
-        do { try process.run(); NSApplication.shared.terminate(nil) }
-        catch { statusLabel.stringValue = "重启失败：\(error.localizedDescription)" }
-    }
-
     var multiplierLabel: String { "\(multiplier)×" }
 
     // MARK: 每秒状态刷新
 
     func tickStatus() {
+        if usesEngineWorker {
+            if running && pendingSession == nil {
+                statusLabel.stringValue = paused ? "⏸ 已暂停" : String(format: "%d× · 采集 %.1f fps · 已渲染 %d · 丢弃过期帧 %d", appliedMultiplier, remoteFPS, remoteFrames, remoteDropped)
+                if engineOutFPS > 0 { statusLabel.stringValue += String(format: " · 估计输出 %.0f fps", engineOutFPS) }
+                if !settingsError.isEmpty { statusLabel.stringValue += " · ⚠️ 设置未应用：" + settingsError }
+            }
+            statusItem?.button?.title = running ? "⚡\(appliedMultiplier)×" : "⚡︎"
+            return
+        }
         guard running else { return }
         var parts: [String] = []
         if let p = pipeline {
@@ -3019,8 +3100,13 @@ final class FirstMouseButton: NSButton {
             if button.title != title { button.title = title }
         }
         if let hud, hud.alphaValue > 0 { hudLabel.stringValue = text }
-        // ⚠️ 自动倍率的判定放在最后：它可能触发 relaunch（进程退出），
-        // 必须等本帧的界面刷新全部做完再动手。
+        if isEngineWorker {
+            reportWorkerReadiness()
+            emitWorkerEvent(["event": "stats", "frames": pipeline?.frameCount ?? 0,
+                             "dropped": pipeline?.droppedCount ?? 0, "fps": pipeline?.feedFPS ?? 0,
+                             "outputFPS": engineOutFPS, "paused": paused])
+        }
+
     }
 
     // MARK: 窗口代理
@@ -3079,10 +3165,268 @@ final class FirstMouseButton: NSButton {
     }
 }
 
+// MARK: - Persistent controller / isolated engine lifecycle
+
+extension AppDelegate {
+    func applicationWillTerminate(_ notification: Notification) {
+        engineSwitchWork?.cancel()
+        pendingTimeout?.cancel()
+        pendingSession?.stop()
+        engineSession?.stop()
+        pipeline?.stop()
+    }
+
+    func reportWorkerReadiness() {
+        guard isEngineWorker, workerHasFrame, !workerReportedReady,
+              offMode || lastEngineGenerated > 0 else { return }
+        workerReportedReady = true
+        emitWorkerEvent(["event": "ready", "window": interpWindow?.windowNumber ?? 0])
+    }
+
+    func sendLiveSettings() {
+        guard usesEngineWorker else { return }
+        let command: [String: Any] = ["command": "quality", "mode": reconstruct.rawValue,
+            "sharpness": sharpenAmount, "badge": showBadge, "metalHUD": metalHUDEnabled]
+        engineSession?.send(command)
+        pendingSession?.send(command)
+    }
+
+    func applyEngineSettings(multiplier value: Int) {
+        guard supportedMultipliers.contains(value), value != multiplier else { return }
+        if value > 4 && !FileManager.default.fileExists(atPath: native.appendingPathComponent("liblsfg_extended.dylib").path) {
+            multiplierPopup.selectItem(at: supportedMultipliers.firstIndex(of: multiplier) ?? 0)
+            statusLabel.stringValue = "缺少扩展引擎，当前可选 2×、3×、4×"
+            return
+        }
+        multiplier = value
+        preferences.set(value, forKey: "multiplier")
+        multiplierPopup.selectItem(at: supportedMultipliers.firstIndex(of: value) ?? 0)
+        scheduleEngineSwitch()
+    }
+
+    func scheduleEngineSwitch() {
+        rebuildStatusMenu()
+        guard usesEngineWorker, running || starting else {
+            statusLabel.stringValue = "设置已保存，下次开始时使用"
+            return
+        }
+        // Coalesce fast clicks. An obsolete warm-up must never replace the selected configuration.
+        engineSwitchWork?.cancel()
+        pendingTimeout?.cancel()
+        pendingSession?.stop(); pendingSession = nil
+        if let _ = engineSession, multiplier == appliedMultiplier,
+           performanceMode == appliedPerformance, mode == appliedMode {
+            starting = false
+            statusLabel.stringValue = "设置已生效"
+            return
+        }
+        starting = true
+        statusLabel.stringValue = "正在后台应用设置…"
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.startEngineSession() }
+        }
+        engineSwitchWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+    }
+
+    func startEngineSession() {
+        guard usesEngineWorker, pendingSession == nil,
+              let target = activeTarget ?? selected else { return }
+        guard CGPreflightScreenCaptureAccess() else {
+            CGRequestScreenCaptureAccess()
+            statusLabel.stringValue = "需要屏幕录制权限，授权后请重新打开本应用"
+            return
+        }
+        let session = EngineSession()
+        let requestedMultiplier = multiplier
+        let requestedPerformance = performanceMode
+        let requestedMode = mode
+        var args = ["--engine-worker", "--window-id", String(target.windowID), "--autostart",
+                    "--multiplier", String(multiplier), "--mode", mode == .window ? "window" : "display",
+                    performanceMode ? "--performance" : "--quality",
+                    "--reconstruct", reconstruct.rawValue, "--reconstruct-sharp", String(sharpenAmount),
+                    "--target-fps", String(targetFPS)]
+        if offMode { args.append("--off") }
+        for flag in ["--test-window", "--native-fullscreen", "--ignore-pixel-cap", "--diagnostics",
+                     "--reconstruct-thru-mid", "--solid", "--no-space-switch"] where hasFlag(flag) { args.append(flag) }
+        for key in ["--test-x", "--test-y", "--test-w", "--test-h", "--queue-depth", "--drawable-count",
+                    "--overlay-alpha", "--output-scale", "--dump-output"] {
+            if let value = argument(key) { args += [key, value] }
+        }
+        for value in arguments(named: "--engine-env") { args += ["--engine-env", value] }
+        if let active = engineSession {
+            args += ["--warm-switch", "--below-window", String(workerOutputWindow)]
+            logLine("engine: switch old=\(active.pid) requested=\(requestedMultiplier)x performance=\(requestedPerformance)")
+        }
+        settingsError = ""
+        starting = true
+        pendingSession = session
+        startButton.title = running ? "停止插帧" : "取消启动"
+        statusLabel.stringValue = running ? "正在后台切换引擎，保留当前画面…" : "正在启动插帧引擎…"
+        session.onEvent = { [weak self, weak session] event in
+            MainActor.assumeIsolated {
+                guard let self, let session else { return }
+                let type = event["event"] as? String ?? ""
+                if self.pendingSession === session {
+                    if type == "ready" {
+                        self.pendingTimeout?.cancel(); self.pendingTimeout = nil
+                        let previous = self.engineSession
+                        self.engineSession = session
+                        self.pendingSession = nil
+                        self.activeTarget = target
+                        self.appliedMultiplier = requestedMultiplier
+                        self.appliedPerformance = requestedPerformance
+                        self.appliedMode = requestedMode
+                        self.workerOutputWindow = event["window"] as? Int ?? 0
+                        self.running = true; self.starting = false
+                        self.remoteFrames = 0; self.remoteDropped = 0; self.remoteFPS = 0; self.engineOutFPS = 0
+                        self.startButton.title = "停止插帧"
+                        self.sendLiveSettings()
+                        session.send(["command": "activate", "paused": self.paused])
+                        previous?.stop()
+                        logLine("engine: ready controller=\(getpid()) worker=\(session.pid) multiplier=\(requestedMultiplier) performance=\(requestedPerformance)")
+                        self.statusLabel.stringValue = "设置已生效 · \(requestedMultiplier)×"
+                        self.rebuildStatusMenu()
+                        if hasFlag("--control-stdin") {
+                            emitWorkerEvent(["event": "applied", "controller": getpid(), "worker": session.pid,
+                                             "multiplier": requestedMultiplier, "performance": requestedPerformance,
+                                             "mode": requestedMode.rawValue])
+                        }
+                        self.scheduleParentPauseTest()
+                    } else if type == "error" || type == "stopped" {
+                        self.failPendingSession(event["message"] as? String ?? "后台采集未能启动")
+                    }
+                    return
+                }
+                guard self.engineSession === session else { return }
+                switch type {
+                case "stats":
+                    self.remoteFrames = event["frames"] as? Int ?? 0
+                    self.remoteDropped = event["dropped"] as? Int ?? 0
+                    self.remoteFPS = event["fps"] as? Double ?? 0
+                    self.engineOutFPS = event["outputFPS"] as? Double ?? 0
+                    self.paused = event["paused"] as? Bool ?? self.paused
+                    if hasFlag("--control-stdin") { emitWorkerEvent(event) }
+                case "stopped", "error":
+                    self.stopInterpolation()
+                    if let message = event["message"] as? String { self.statusLabel.stringValue = message }
+                case "showControl": self.showControl()
+                default: break
+                }
+            }
+        }
+        session.onDiagnostic = { [weak session] line in
+            logLine("worker[\(session?.pid ?? 0)]: \(line)")
+            if hasFlag("--diagnostics") || hasFlag("--test-seconds") { print(line) }
+        }
+        session.onExit = { [weak self, weak session] code in
+            MainActor.assumeIsolated {
+                guard let self, let session else { return }
+                if self.pendingSession === session { self.failPendingSession("引擎退出（\(code)）") }
+                else if self.engineSession === session {
+                    self.stopInterpolation()
+                    self.statusLabel.stringValue = "引擎已退出（\(code)），可重新开始"
+                }
+            }
+        }
+        do {
+            try session.start(executable: arguments[0], arguments: args)
+            if hasFlag("--control-stdin") { emitWorkerEvent(["event": "warming", "worker": session.pid]) }
+            sendLiveSettings()
+            let timeout = DispatchWorkItem { [weak self, weak session] in
+                MainActor.assumeIsolated {
+                    guard let self, let session, self.pendingSession === session else { return }
+                    self.failPendingSession("等待新引擎画面超时，请确认源窗口仍在渲染")
+                }
+            }
+            pendingTimeout = timeout
+            DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: timeout)
+        } catch { failPendingSession(error.localizedDescription) }
+    }
+
+    func failPendingSession(_ message: String) {
+        pendingTimeout?.cancel(); pendingTimeout = nil
+        pendingSession?.stop(); pendingSession = nil
+        starting = false
+        if engineSession != nil {
+            multiplier = appliedMultiplier; performanceMode = appliedPerformance; mode = appliedMode
+            preferences.set(multiplier, forKey: "multiplier")
+            preferences.set(performanceMode, forKey: "performanceMode")
+            preferences.set(mode.rawValue, forKey: "mode")
+            multiplierPopup.selectItem(at: supportedMultipliers.firstIndex(of: multiplier) ?? 0)
+            perfModeCheck.state = performanceMode ? .on : .off
+            modePopup.selectItem(at: mode.rawValue)
+        }
+        startButton.title = running ? "停止插帧" : "开始插帧"
+        statusLabel.stringValue = "设置未应用：\(message)" + (running ? "；继续使用原引擎" : "")
+        settingsError = message
+        logLine("engine: \(statusLabel.stringValue)")
+        rebuildStatusMenu()
+        if hasFlag("--control-stdin") { emitWorkerEvent(["event": "error", "message": statusLabel.stringValue]) }
+    }
+
+    func receiveWorkerCommand(_ command: [String: Any]) {
+        let name = command["command"] as? String ?? ""
+        if usesEngineWorker { // Explicit diagnostic control channel, never enabled in normal launches.
+            switch name {
+            case "multiplier": applyEngineSettings(multiplier: command["value"] as? Int ?? 2)
+            case "performance":
+                performanceMode = command["value"] as? Bool ?? false
+                preferences.set(performanceMode, forKey: "performanceMode")
+                perfModeCheck.state = performanceMode ? .on : .off
+                scheduleEngineSwitch()
+            case "mode":
+                modePopup.selectItem(at: command["value"] as? Int ?? 0); modeChanged()
+            case "quality":
+                if let value = command["mode"] as? String,
+                   let mode = ReconstructMode(rawValue: value),
+                   let index = ReconstructMode.allCases.firstIndex(of: mode) { reconstructPopup.selectItem(at: index) }
+                if let value = command["sharpness"] as? Double { sharpnessSlider.doubleValue = value }
+                reconstructionChanged()
+            case "pause": setPaused(command["value"] as? Bool ?? false)
+            case "start": startInterpolation()
+            case "stop": stopInterpolation()
+            case "quit": NSApplication.shared.terminate(nil)
+            default: break
+            }
+            return
+        }
+        switch name {
+        case "activate":
+            workerActivated = true
+            interpWindow?.alphaValue = workerOutputAlpha
+            interpWindow?.orderFrontRegardless()
+            if overlayActive, let window = interpWindow { showGameHUD(overlayFrame: window.frame) }
+            if command["paused"] as? Bool == true { setPaused(true) }
+        case "quality":
+            if let value = command["mode"] as? String, let mode = ReconstructMode(rawValue: value) { reconstruct = mode }
+            if let value = command["sharpness"] as? Double { sharpenAmount = Float(min(max(value, 0), 1)) }
+            if let value = command["badge"] as? Bool { showBadge = value }
+            if let value = command["metalHUD"] as? Bool { metalHUDEnabled = value }
+            pipeline?.reconstruct = reconstruct
+            pipeline?.sharpenAmount = sharpenAmount
+            badge?.isHidden = !showBadge || !floatingControlsVisible
+            applyMetalHUD()
+        case "pause": setPaused(command["value"] as? Bool ?? false)
+        case "stop": stopInterpolation(); NSApplication.shared.terminate(nil)
+        default: break
+        }
+    }
+
+    func scheduleParentPauseTest() {
+        guard !pauseTestScheduled, let raw = argument("--test-pause"), let delay = Double(raw) else { return }
+        pauseTestScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.setPaused(true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self?.setPaused(false) }
+        }
+    }
+}
+
 // MARK: - 入口
 
 let application = NSApplication.shared
-application.setActivationPolicy(.regular)
+application.setActivationPolicy(isEngineWorker ? .accessory : .regular)
 let delegate = MainActor.assumeIsolated { AppDelegate() }
 application.delegate = delegate
 application.run()

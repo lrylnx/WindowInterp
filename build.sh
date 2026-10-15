@@ -10,8 +10,13 @@ NAME="窗口插帧助手"
 DESKTOP="${DESKTOP:-$HOME/Desktop}"
 ENGINE_SOURCES=(
     "$DESKTOP/LSFG 视频播放器.app/Contents/Resources/Native"
+    "/Applications/窗口插帧助手.app/Contents/Resources/Native"
     "$DESKTOP/MetalFrame.app/Contents/Resources/Native"
 )
+
+if [ -n "${LSFGM_LSFG_SOURCES:-}" ]; then
+    ENGINE_SOURCES=("${(@s/:/)LSFGM_LSFG_SOURCES}" "${ENGINE_SOURCES[@]}")
+fi
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Native" "$APP/Contents/Resources/Tools"
 
@@ -42,6 +47,8 @@ fi
 # 图标（沿用播放器那份，缺就跳过）
 if [ -f "$DESKTOP/LSFG 视频播放器.app/Contents/Resources/AppIcon.icns" ]; then
     cp -f "$DESKTOP/LSFG 视频播放器.app/Contents/Resources/AppIcon.icns" "$APP/Contents/Resources/"
+elif [ -f "/Applications/窗口插帧助手.app/Contents/Resources/AppIcon.icns" ]; then
+    cp -f "/Applications/窗口插帧助手.app/Contents/Resources/AppIcon.icns" "$APP/Contents/Resources/"
 elif [ -f AppIcon.icns ]; then
     cp -f AppIcon.icns "$APP/Contents/Resources/"
 fi
@@ -68,7 +75,7 @@ done
 
 # 编译：必须摘掉 WorkBuddy 注入层，否则产物会带上无效的打包/沙箱钩子
 env -u NODE_OPTIONS -u CODEBUDDY_BROKERED_FS_HOOK_ENABLED -u CODEBUDDY_SAFE_DELETE_SANDBOX \
-    xcrun swiftc -O main.swift -o "$APP/Contents/MacOS/WindowInterp" \
+    xcrun swiftc -O main.swift EngineSession.swift -o "$APP/Contents/MacOS/WindowInterp" \
     -Xlinker -rpath -Xlinker @executable_path/../Resources/Native
 # 注意：不加 --options runtime —— Hardened Runtime 会拦下 DYLD_INSERT_LIBRARIES，
 # LSFG 引擎就注入不进去了。
