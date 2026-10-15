@@ -74,8 +74,19 @@ for F in liblsfg_metal.dylib liblsfg_extended.dylib libMoltenVK.dylib; do
 done
 
 # 编译：必须摘掉 WorkBuddy 注入层，否则产物会带上无效的打包/沙箱钩子
+#
+# ⚠️ 必须显式指定 `-target …-macos15.0`。不写的话 swiftc 默认按**本机系统版本**做
+#    deployment target，在 macOS 27 上编出来的二进制 `minos` 就是 27.0 ⇒ **只能在
+#    macOS 27+ 启动**（低版本双击直接报「需要 macOS 27」），而 Info.plist 里写的
+#    却是 LSMinimumSystemVersion 15.0 —— 两边不一致，是个静默的坑。
+#    实测降到 15.0 是**零编译错误**（代码用到的 API 15.0 全都已有），所以这里就钉
+#    死 15.0，与 Info.plist 对齐，macOS 15 及以上都能跑。
+#    再往下（14.0/13.0）要先在 ScreenCaptureKit 那几个属性外面补 #available 守卫，
+#    没那个必要。
+#    架构固定 arm64：LSFG 引擎 dylib 只有 arm64，这App本来就只面向 Apple Silicon。
 env -u NODE_OPTIONS -u CODEBUDDY_BROKERED_FS_HOOK_ENABLED -u CODEBUDDY_SAFE_DELETE_SANDBOX \
-    xcrun swiftc -O main.swift EngineSession.swift -o "$APP/Contents/MacOS/WindowInterp" \
+    xcrun swiftc -O -target arm64-apple-macos15.0 main.swift EngineSession.swift \
+    -o "$APP/Contents/MacOS/WindowInterp" \
     -Xlinker -rpath -Xlinker @executable_path/../Resources/Native
 # 注意：不加 --options runtime —— Hardened Runtime 会拦下 DYLD_INSERT_LIBRARIES，
 # LSFG 引擎就注入不进去了。

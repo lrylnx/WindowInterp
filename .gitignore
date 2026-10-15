@@ -2,6 +2,10 @@
 窗口插帧助手.app/
 dist/
 
+# 成品压缩包只作为 Release 附件，不进 git
+release/
+*.zip
+
 # 签名材料（私钥不能进仓库）
 signing/
 
