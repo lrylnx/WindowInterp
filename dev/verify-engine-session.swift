@@ -51,9 +51,13 @@ import Darwin
         try stubborn.start(executable: CommandLine.arguments[0], arguments: ["--fixture", "--stubborn"])
         spin(seconds: 3) { ready }
         require(ready, "stubborn worker startup")
+        // Fill a pipe whose reader is hung. Sending settings must never freeze the UI/runloop.
+        let sentAt = Date()
+        stubborn.send(["command": "quality", "value": String(repeating: "x", count: 512 * 1024)])
+        require(Date().timeIntervalSince(sentAt) < 0.5, "full worker pipe blocked the main thread")
         stubborn.stop()
         spin(seconds: 6) { killed != nil }
         require(killed == SIGKILL, "bounded shutdown of hung engine")
-        print("PASS hung engine reaped without blocking main thread")
+        print("PASS full pipe stays responsive; hung engine reaped without blocking main thread")
     }
 }

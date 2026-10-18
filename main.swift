@@ -15,7 +15,7 @@ import Carbon.HIToolbox   // 系统级全局热键（RegisterEventHotKey）
 
 /// 版本标识 —— 「功能不好使」排查第一步永远是问版本（红线），所以把它打进
 /// 启动日志和菜单栏菜单头部，谁都能报出自己跑的是哪一版。
-let appVersion = "1.4.1"
+let appVersion = "1.4.2"
 
 // MARK: - 引擎注入（与 LSFG 视频播放器同一套路）
 
@@ -600,7 +600,7 @@ final class CASPass {
     private var bufs: [MTLTexture] = []
     private var bufSize = CGSize.zero
 
-    /// shader 编译失败时就一直是 nil —— 由调用方降级到 `.lanczos`。
+    /// shader 编译失败时就一直是 nil —— 由调用方降级到原始画质。
     private(set) var disabledReason: String?
 
     var enabled: Bool { pipeline != nil && sampler != nil }
@@ -653,13 +653,14 @@ final class CASPass {
     }
 
     /// `src` → CAS → `dst`。必须与 CI 用**同一条 commandBuffer**。
-    func encode(commandBuffer: MTLCommandBuffer, src: MTLTexture, dst: MTLTexture, sharpness: Float) {
-        guard let pipeline, let sampler else { return }
+    @discardableResult
+    func encode(commandBuffer: MTLCommandBuffer, src: MTLTexture, dst: MTLTexture, sharpness: Float) -> Bool {
+        guard let pipeline, let sampler else { return false }
         let rp = MTLRenderPassDescriptor()
         rp.colorAttachments[0].texture = dst
         rp.colorAttachments[0].loadAction = .dontCare   // 全屏三角形铺满，不需要旧内容
         rp.colorAttachments[0].storeAction = .store
-        guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: rp) else { return }
+        guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: rp) else { return false }
         enc.setRenderPipelineState(pipeline)
         enc.setFragmentTexture(src, index: 0)
         enc.setFragmentSamplerState(sampler, index: 0)
@@ -669,6 +670,7 @@ final class CASPass {
         enc.setFragmentBytes(&sharp, length: MemoryLayout<Float>.stride, index: 1)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
+        return true
     }
 
     private static let shaderSource = """
@@ -739,7 +741,7 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
     let context: CIContext
-    private let frameQueue = DispatchQueue(label: "windowinterp.capture")
+    private let frameQueue = DispatchQueue(label: "windowinterp.capture", qos: .userInteractive)
     private let renderQueue = DispatchQueue(label: "windowinterp.render", qos: .userInteractive)
     private let lock = NSLock()
 
@@ -777,9 +779,7 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // 渲染层由主线程在开始前设定一次，之后只读。
     var metal: CAMetalLayer
-    /// **期望的输出尺寸**（drawable 的像素尺寸）。
-    /// ⚠️ 它与**采集尺寸解耦**：`--resolution` 只压采集端，输出端由 `--output-scale` 决定
-    /// （默认 1.0 = 与采集相同 = 1.1.0 的行为，一个像素都不变）。
+    /// **期望的输出尺寸**（与采集尺寸一致，单位是像素）。
     /// `present()` 里以 **drawable 纹理的真实尺寸**为准（那是唯一真相），这个值只做记账。
     private let settingsLock = NSLock()
     private var expectedRenderSize: CGSize
@@ -943,11 +943,16 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func drain() {
         while true {
-            lock.lock()
-            guard !stopped, let image = latest else { renderScheduled = false; lock.unlock(); return }
-            latest = nil
-            lock.unlock()
-            autoreleasepool { present(image) }
+            let hasFrame = lock.withLock {
+                if stopped || latest == nil { renderScheduled = false; return false }
+                return true
+            }
+            guard hasFrame else { return }
+            // 等 GPU 的时候仍让采集队列覆盖邮箱。旧实现先取走一帧再等 drawable，
+            // 会呈现已经过期的帧；GPU 繁忙时还会丢掉最后一帧且无人重新唤醒。
+            // 等待只发生在专用渲染队列，定时检查 stop，不阻塞 UI 或采集。
+            guard inFlight.wait(timeout: .now() + 0.05) == .success else { continue }
+            autoreleasepool { presentLatest() }
         }
     }
 
@@ -957,18 +962,34 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
     /// 「期望输出尺寸 ≠ drawable 实际尺寸」的去重键，别每帧刷一行日志。
     private var lastSizeMismatchKey = ""
 
-    private func present(_ image: CIImage) {
-        guard inFlight.wait(timeout: .now()) == .success else {
-            lock.withLock { replacedFrames += 1 }
-            return
-        }
+    private func presentLatest() {
         var submitted = false
         defer { if !submitted { inFlight.signal() } }
-        guard let drawable = metal.nextDrawable(), let command = commandQueue.makeCommandBuffer() else { return }
         guard !lock.withLock({ stopped }) else { return }
+        guard let drawable = metal.nextDrawable(), let command = commandQueue.makeCommandBuffer() else {
+            // 不可见图层可能立即返回 nil，避免持续重试占满 CPU。
+            Thread.sleep(forTimeInterval: 0.01)
+            return
+        }
+        // nextDrawable 也可能等垂直同步；拿到真正可写的 drawable 后才取最新帧。
+        let frame: CIImage? = lock.withLock {
+            guard !stopped else { return nil }
+            let image = latest
+            latest = nil
+            capturedImage = image
+            return image
+        }
+        guard let image = frame else { return }
         let limiter = inFlight
-        command.addCompletedHandler { _ in limiter.signal() }
-        lock.lock(); capturedImage = image; lock.unlock()
+        // 保持输入 IOSurface 活到 GPU 完成，不能让下一帧覆盖 capturedImage 后过早回收。
+        command.addCompletedHandler { [weak self, image] completed in
+            withExtendedLifetime(image) {}
+            limiter.signal()
+            if completed.status == .error {
+                guard let self, !self.lock.withLock({ self.stopped }) else { return }
+                self.onFatal?("GPU 渲染失败：\(completed.error?.localizedDescription ?? "未知错误")")
+            }
+        }
         let extent = image.extent
         // 输出尺寸以 **drawable 纹理的真实尺寸**为准（唯一真相）。
         // `renderSize` 只是调用方的期望值；两者不一致说明哪边算错了，下面只记一次日志。
@@ -1039,7 +1060,7 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
             } else {
                 casUnavailable = true
                 let why = casPass?.disabledReason ?? "拿不到中间纹理"
-                logLine("reconstruct: ⚠️ CAS 不可用（\(why)）→ 从这一帧起退回 Lanczos 重采样档（不再重试）")
+                logLine("reconstruct: ⚠️ CAS 不可用（\(why)）→ 退回原始画质（不再重试）")
             }
         }
         let wantMid = thruMid || casSharp >= 0
@@ -1053,11 +1074,13 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
             // ① CI 渲染（重采样 + 翻转）→ 中间纹理
             context.render(transformed, to: bufs.src, commandBuffer: command, bounds: bounds, colorSpace: colorSpace)
             // ② CAS（诊断档 `--reconstruct-thru-mid` 会跳过这一步）
-            if casSharp >= 0 { pass.encode(commandBuffer: command, src: bufs.src, dst: bufs.dst, sharpness: casSharp) }
+            let sharpened = casSharp >= 0 && pass.encode(commandBuffer: command, src: bufs.src, dst: bufs.dst, sharpness: casSharp)
             // ③ CI 把结果拷进 drawable —— **收尾这一步是硬约束**
-            let midTex = casSharp >= 0 ? bufs.dst : bufs.src
+            let midTex = sharpened ? bufs.dst : bufs.src
             if let outImage = CIImage(mtlTexture: midTex, options: [.colorSpace: colorSpace]) {
                 context.render(outImage, to: drawable.texture, commandBuffer: command, bounds: bounds, colorSpace: colorSpace)
+            } else {
+                context.render(transformed, to: drawable.texture, commandBuffer: command, bounds: bounds, colorSpace: colorSpace)
             }
         } else {
             context.render(transformed, to: drawable.texture, commandBuffer: command, bounds: bounds, colorSpace: colorSpace)
@@ -1251,6 +1274,9 @@ final class FirstMouseButton: NSButton {
     /// 暂停：管线和采集都停掉（画面定格在最后一帧、立刻省电），覆盖层保持显示，
     /// 这样 HUD 上的「继续」按钮还在原地，用户随时能恢复。
     var paused = false
+    // Only telemetry acknowledging the latest pause request may update the controller.
+    // A warming worker inherits this revision when it takes over.
+    var pauseRevision = 0
     var mode: CaptureMode = {
         if let m = argument("--mode"), m == "display" { return .display }
         if let m = argument("--mode"), m == "window" { return .window }
@@ -1294,6 +1320,7 @@ final class FirstMouseButton: NSButton {
     }()
     var reconstructPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     var sharpnessSlider = NSSlider(value: 0.5, minValue: 0, maxValue: 1, target: nil, action: nil)
+    var sharpnessValue = NSTextField(labelWithString: "50%")
     var engineSession: EngineSession?
     var pendingSession: EngineSession?
     var activeTarget: CaptureTarget?
@@ -1401,6 +1428,8 @@ final class FirstMouseButton: NSButton {
                 MainActor.assumeIsolated { self?.receiveWorkerCommand(command) }
             }
         }
+        if hasFlag("--control-stdin") { emitWorkerEvent(["event": "controller", "controller": getpid()]) }
+        if exitAfter > 0 { emitWorkerEvent(["event": "testProcess", "pid": getpid()]) }
         // 覆盖层的**实时跟随**：4Hz，只查源窗口一个 frame（便宜），
         // 拖动/缩放源窗口时覆盖层立刻贴上去。以前只有 5 秒一次的兜底，
         // 贴源覆盖层一旦通用所有场景，那个延迟就成了硬伤。
@@ -1599,9 +1628,12 @@ final class FirstMouseButton: NSButton {
         sharpnessSlider.action = #selector(reconstructionChanged)
         sharpnessSlider.isContinuous = true
         sharpnessSlider.isEnabled = reconstruct == .cas
-        sharpnessSlider.toolTip = "锐化强度 0–100%，实时预览；过高可能放大噪点。"
+        sharpnessSlider.toolTip = "锐化强度 0–100%，实时预览；建议从 20–40% 开始，过高可能放大噪点。"
         sharpnessSlider.widthAnchor.constraint(equalToConstant: 120).isActive = true
-        let qualityRow = NSStackView(views: [label("画质", size: 11), reconstructPopup, label("锐化", size: 11), sharpnessSlider])
+        sharpnessValue.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        sharpnessValue.stringValue = "\(Int((sharpenAmount * 100).rounded()))%"
+        sharpnessValue.widthAnchor.constraint(equalToConstant: 36).isActive = true
+        let qualityRow = NSStackView(views: [label("画质", size: 11), reconstructPopup, label("锐化", size: 11), sharpnessSlider, sharpnessValue])
         qualityRow.spacing = 10
         let note = label("设置自动生效 · 倍率/性能模式在后台切换 · 画质实时预览", size: 11, color: .secondaryLabelColor)
         let switchesContent = vertical([switches, qualityRow, note], spacing: 10)
@@ -1743,6 +1775,7 @@ final class FirstMouseButton: NSButton {
         guard ReconstructMode.allCases.indices.contains(index) else { return }
         reconstruct = ReconstructMode.allCases[index]
         sharpenAmount = Float(sharpnessSlider.doubleValue)
+        sharpnessValue.stringValue = "\(Int((sharpenAmount * 100).rounded()))%"
         sharpnessSlider.isEnabled = reconstruct == .cas
         preferences.set(reconstruct.rawValue, forKey: "reconstruct")
         preferences.set(sharpenAmount, forKey: "reconstructSharp")
@@ -1901,16 +1934,20 @@ final class FirstMouseButton: NSButton {
                 guard self.startGeneration == generation else { return }
                 logLine("start: 已拿到 shareableContent")
                 let filter: SCContentFilter
-                var sourceFrame = target.frame
+                guard let scw = content.windows.first(where: { $0.windowID == target.windowID }) else {
+                    let message = "目标窗口已不存在，请刷新列表"
+                    self.statusLabel.stringValue = message
+                    if isEngineWorker { emitWorkerEvent(["event": "error", "message": message]) }
+                    return
+                }
+                // The window can move/resize between enumeration, resume and engine warm-up.
+                // Choose both capture size and display from the fresh ScreenCaptureKit snapshot.
+                var sourceFrame = scw.frame
 
                 if mode == .window {
-                    guard let scw = content.windows.first(where: { $0.windowID == target.windowID }) else {
-                        self.statusLabel.stringValue = "目标窗口已不存在，请刷新列表"
-                        return
-                    }
                     filter = SCContentFilter(desktopIndependentWindow: scw)
                 } else {
-                    guard let display = content.displays.first(where: { $0.frame.contains(CGPoint(x: target.frame.midX, y: target.frame.midY)) }) ?? content.displays.first else {
+                    guard let display = content.displays.first(where: { $0.frame.contains(CGPoint(x: sourceFrame.midX, y: sourceFrame.midY)) }) ?? content.displays.first else {
                         self.statusLabel.stringValue = "找不到目标所在的显示器"
                         return
                     }
@@ -1927,7 +1964,7 @@ final class FirstMouseButton: NSButton {
                 let captureHeight = Int(planned.height)
                 let captureSize = CGSize(width: captureWidth, height: captureHeight)
                 let fps = self.effectiveCaptureFPS
-                logLine("start: 源 \(target.frame) → 采集=输出 \(captureWidth)x\(captureHeight) @\(Int(fps))fps "
+                logLine("start: 源 \(sourceFrame) → 采集=输出 \(captureWidth)x\(captureHeight) @\(Int(fps))fps "
                         + "(物理上限 \(self.physicalPixelSize(for: sourceFrame)) autoFPS=\(self.autoMatchFPS))")
                 logLine("start: 重建档=\(self.reconstruct.rawValue) 强度=\(self.sharpenAmount)")
 
@@ -2400,10 +2437,11 @@ final class FirstMouseButton: NSButton {
     /// 暂停 = 停采集停渲染（画面定格、立刻省电），覆盖层与 HUD 原地保留，
     /// 用户随时按「继续」或在画面上点一下恢复。不退出、不动源窗口。
     func setPaused(_ value: Bool) {
-        guard running else { return }
+        guard running, paused != value else { return }
         if usesEngineWorker {
             paused = value
-            engineSession?.send(["command": "pause", "value": value])
+            pauseRevision += 1
+            engineSession?.send(["command": "pause", "value": value, "revision": pauseRevision])
             rebuildStatusMenu()
             return
         }
@@ -2411,6 +2449,9 @@ final class FirstMouseButton: NSButton {
         pauseButton?.title = value ? "继续" : "暂停"
         gameHUDPause?.title = value ? "▶ 继续" : "⏸ 暂停"
         if value {
+            // 连续「继续→暂停」时，使尚未完成的异步 startCapture 失效。
+            startGeneration += 1
+            starting = false
             pipeline?.stop()
             logLine("pause: 已暂停（采集/渲染已停，画面定格）")
         } else {
@@ -2618,10 +2659,10 @@ final class FirstMouseButton: NSButton {
     /// 跨 App 收集全部窗口信息，很贵，只能 5 秒一拍。而跟随要的是**实时**，
     /// 所以这里换一条几十微秒的便宜路径（一次 syscall，返回在屏窗口列表）。
     func windowFrameFromCGWindowList(_ id: CGWindowID) -> CGRect? {
-        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
-                                                    kCGNullWindowID) as? [[String: Any]] else { return nil }
+        guard let list = CGWindowListCopyWindowInfo(.optionIncludingWindow, id) as? [[String: Any]] else { return nil }
         for info in list {
             guard let num = info[kCGWindowNumber as String] as? NSNumber, num.uint32Value == id else { continue }
+            guard info[kCGWindowIsOnscreen as String] as? Bool == true else { return nil }
             guard let d = info[kCGWindowBounds as String] as? NSDictionary,
                   let rect = CGRect(dictionaryRepresentation: d) else { return nil }
             return rect
@@ -2686,31 +2727,17 @@ final class FirstMouseButton: NSButton {
         logLine("resize: \(Int(f.width))x\(Int(f.height)) → 采集=输出 \(w)x\(h)")
     }
 
-    /// 5 秒一次的**兜底**（`periodicRefresh` 里调）。
-    /// 它比快路径多做一件事：确认目标窗口**还在不在**（枚举才知道窗口是否已关闭）；
-    /// 用的帧也更权威，所以沿用同两个 helper。
+    /// 5 秒一次检查窗口是否关闭；坐标必须实时读取，不能复用启动时的 targets 缓存。
     func followTargetSize() {
-        guard let target = selected else { return }
-        guard let current = targets.first(where: { $0.windowID == target.windowID }) else {
-            statusLabel.stringValue = "⚠️ 目标窗口已关闭"
+        guard interpTargetID != 0 else { return }
+        guard let windows = CGWindowListCopyWindowInfo(.optionIncludingWindow, interpTargetID) as? [[String: Any]] else { return }
+        guard windows.contains(where: { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == interpTargetID }) else {
+            if isEngineWorker { emitWorkerEvent(["event": "error", "message": "目标窗口已关闭，请重新选择窗口"]) }
+            stopInterpolation()
+            statusLabel.stringValue = "目标窗口已关闭，请重新选择窗口"
             return
         }
-        let f = current.frame
-        if overlayActive, let iw = interpWindow, iw.isVisible {
-            let nf = appkitRect(fromCG: f)
-            let cur = iw.frame
-            if abs(nf.minX - cur.minX) > 1 || abs(nf.minY - cur.minY) > 1
-                || abs(nf.width - cur.width) > 1 || abs(nf.height - cur.height) > 1 {
-                iw.setFrame(nf, display: true)
-                positionGameHUD(overlayFrame: nf)
-                logLine("overlay-follow(兜底): 贴住源窗口 \(Int(f.width))x\(Int(f.height)) @\(Int(f.minX)),\(Int(f.minY))")
-            }
-        }
-        guard abs(f.width - target.frame.width) > 2 || abs(f.height - target.frame.height) > 2 else { return }
-        // 同样要 overlayActive：`--test-window` 下输出窗是固定尺寸的测量窗，
-        // 让它跟着源窗口改采集分辨率既没意义、又会给测量结果引入变量。
-        guard overlayActive else { return }
-        applyCaptureSizeChange(f)
+        followOverlayFrame()
     }
 
     // MARK: 屏幕换算
@@ -3110,7 +3137,7 @@ final class FirstMouseButton: NSButton {
             reportWorkerReadiness()
             emitWorkerEvent(["event": "stats", "frames": pipeline?.frameCount ?? 0,
                              "dropped": pipeline?.droppedCount ?? 0, "fps": pipeline?.feedFPS ?? 0,
-                             "outputFPS": engineOutFPS, "paused": paused])
+                             "outputFPS": engineOutFPS, "paused": paused, "pauseRevision": pauseRevision])
         }
 
     }
@@ -3240,7 +3267,10 @@ extension AppDelegate {
               let target = activeTarget ?? selected else { return }
         guard CGPreflightScreenCaptureAccess() else {
             CGRequestScreenCaptureAccess()
+            starting = false
+            startButton.title = "开始插帧"
             statusLabel.stringValue = "需要屏幕录制权限，授权后请重新打开本应用"
+            if hasFlag("--control-stdin") { emitWorkerEvent(["event": "error", "message": statusLabel.stringValue]) }
             return
         }
         let session = EngineSession()
@@ -3288,7 +3318,7 @@ extension AppDelegate {
                         self.remoteFrames = 0; self.remoteDropped = 0; self.remoteFPS = 0; self.engineOutFPS = 0
                         self.startButton.title = "停止插帧"
                         self.sendLiveSettings()
-                        session.send(["command": "activate", "paused": self.paused])
+                        session.send(["command": "activate", "paused": self.paused, "revision": self.pauseRevision])
                         previous?.stop()
                         logLine("engine: ready controller=\(getpid()) worker=\(session.pid) multiplier=\(requestedMultiplier) performance=\(requestedPerformance)")
                         self.statusLabel.stringValue = "设置已生效 · \(requestedMultiplier)×"
@@ -3311,8 +3341,16 @@ extension AppDelegate {
                     self.remoteDropped = event["dropped"] as? Int ?? 0
                     self.remoteFPS = event["fps"] as? Double ?? 0
                     self.engineOutFPS = event["outputFPS"] as? Double ?? 0
-                    self.paused = event["paused"] as? Bool ?? self.paused
-                    if hasFlag("--control-stdin") { emitWorkerEvent(event) }
+                    if event["pauseRevision"] as? Int == self.pauseRevision {
+                        self.paused = event["paused"] as? Bool ?? self.paused
+                    }
+                    if hasFlag("--control-stdin") {
+                        var report = event
+                        report["worker"] = session.pid
+                        report["controllerPaused"] = self.paused
+                        report["controllerPauseRevision"] = self.pauseRevision
+                        emitWorkerEvent(report)
+                    }
                 case "stopped", "error":
                     self.stopInterpolation()
                     if let message = event["message"] as? String { self.statusLabel.stringValue = message }
@@ -3399,6 +3437,7 @@ extension AppDelegate {
         }
         switch name {
         case "activate":
+            pauseRevision = command["revision"] as? Int ?? pauseRevision
             workerActivated = true
             interpWindow?.alphaValue = workerOutputAlpha
             interpWindow?.orderFrontRegardless()
@@ -3413,7 +3452,9 @@ extension AppDelegate {
             pipeline?.sharpenAmount = sharpenAmount
             badge?.isHidden = !showBadge || !floatingControlsVisible
             applyMetalHUD()
-        case "pause": setPaused(command["value"] as? Bool ?? false)
+        case "pause":
+            pauseRevision = command["revision"] as? Int ?? pauseRevision
+            setPaused(command["value"] as? Bool ?? false)
         case "stop": stopInterpolation(); NSApplication.shared.terminate(nil)
         default: break
         }

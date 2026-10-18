@@ -12,7 +12,7 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
-APP = ROOT / '窗口插帧助手.app/Contents/MacOS/WindowInterp'
+APP = Path(os.environ.get('WI_APP_PATH', str(ROOT / '窗口插帧助手.app')))
 OUT = ROOT / 'dev/verification-live-settings'
 OUT.mkdir(exist_ok=True)
 
@@ -30,6 +30,9 @@ def run():
     events = queue.Queue()
     log = (OUT / 'events.jsonl').open('w')
     history = []
+    controller = None
+    command_pipe = None
+    ipc = tempfile.TemporaryDirectory(prefix='ipc-', dir=OUT)
     try:
         with (OUT/'source.log').open('w') as stream:
             source = subprocess.Popen([str(ROOT/'dev/testpattern'), '--width', '640', '--height', '400',
@@ -37,25 +40,42 @@ def run():
         time.sleep(1)
         match = re.search(r'windowNumber=(\d+)', (OUT/'source.log').read_text())
         assert match, 'test source failed to create a window'
-        app = subprocess.Popen([str(APP), '--window-id', match[1], '--autostart', '--test-window',
+        # LaunchServices uses the App's own screen-recording grant, like a Finder launch.
+        # Directly spawning its executable inherits the terminal/agent's TCC identity.
+        fifo = Path(ipc.name) / 'commands'
+        os.mkfifo(fifo)
+        output = OUT / 'controller.log'
+        output.write_text('')
+        pipe_fd = os.open(fifo, os.O_RDWR)
+        command_pipe = os.fdopen(pipe_fd, 'w', buffering=1)
+        app = subprocess.Popen(['open', '-n', '-W', '--stdin', str(fifo), '--stdout', str(output),
+                                '--stderr', str(output), str(APP), '--args',
+                                '--window-id', match[1], '--autostart', '--test-window',
                                 '--test-x', '740', '--test-y', '60', '--test-w', '640', '--test-h', '400',
                                 '--multiplier', '2', '--quality', '--control-stdin'],
-                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                               text=True, bufsize=1)
-        controller = app.pid
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         def read():
-            for line in app.stdout:
-                if line.startswith('WI_EVENT '):
-                    event = json.loads(line[9:])
-                    event['time'] = time.monotonic()
-                    history.append(event)
-                    log.write(json.dumps(event, ensure_ascii=False)+'\n'); log.flush()
-                    if 'worker' in event: workers.add(event['worker'])
-                    events.put(event)
-        threading.Thread(target=read, daemon=True).start()
+            nonlocal controller
+            with output.open() as stream:
+                while True:
+                    line = stream.readline()
+                    if not line:
+                        if app.poll() is not None: return
+                        time.sleep(0.02)
+                        continue
+                    if line.startswith('WI_EVENT '):
+                        event = json.loads(line[9:])
+                        event['time'] = time.monotonic()
+                        history.append(event)
+                        if event.get('event') == 'controller': controller = event['controller']
+                        log.write(json.dumps(event, ensure_ascii=False)+'\n'); log.flush()
+                        if 'worker' in event: workers.add(event['worker'])
+                        events.put(event)
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
         def send(command, **values):
             assert app.poll() is None, 'controller unexpectedly exited'
-            app.stdin.write(json.dumps(dict(command=command, **values))+'\n'); app.stdin.flush()
+            command_pipe.write(json.dumps(dict(command=command, **values))+'\n'); command_pipe.flush()
         def wait(predicate, timeout=35, allow_error=False):
             deadline = time.monotonic()+timeout
             while time.monotonic() < deadline:
@@ -67,7 +87,9 @@ def run():
                 if predicate(event): return event
             raise AssertionError('timed out waiting for expected event; '+repr(history[-4:]))
         def applied(multiplier, performance):
+            nonlocal controller
             e = wait(lambda e: e.get('event') == 'applied' and e['multiplier'] == multiplier and e['performance'] == performance)
+            if controller is None: controller = e['controller']
             assert e['controller'] == controller
             assert alive(e['worker'])
             return e['worker']
@@ -99,6 +121,43 @@ def run():
         send('pause', value=False)
         wait(lambda e: e.get('event') == 'stats' and not e['paused'] and e['frames'] > 5)
         print('PASS pause stops work and resumes', flush=True)
+        # Repeated resume must not rebuild capture/reset frame counters. A pause arriving
+        # during asynchronous resume must cancel that start rather than resume behind the UI.
+        before = wait(lambda e: e.get('event') == 'stats' and e['frames'] > 100)['frames']
+        send('pause', value=False); send('pause', value=False)
+        wait(lambda e: e.get('event') == 'stats')
+        current = wait(lambda e: e.get('event') == 'stats')
+        assert current['frames'] >= before, 'duplicate resume rebuilt the capture pipeline'
+        send('pause', value=True)
+        wait(lambda e: e.get('event') == 'stats' and e['paused'])
+        send('pause', value=False); send('pause', value=True)
+        wait(lambda e: e.get('event') == 'stats' and e['paused'])
+        paused = wait(lambda e: e.get('event') == 'stats' and e['paused'])
+        again = wait(lambda e: e.get('event') == 'stats' and e['paused'])
+        assert paused['frames'] == again['frames'], 'cancelled resume started rendering while paused'
+        send('pause', value=False)
+        wait(lambda e: e.get('event') == 'stats' and not e['paused'] and e['frames'] > 5)
+        print('PASS duplicate resume and rapid pause/resume preserve requested state', flush=True)
+        # A ready replacement may have emitted unpaused telemetry before activation.
+        # The controller must retain the requested pause until the new worker acknowledges it.
+        send('pause', value=True)
+        paused = wait(lambda e: e.get('event') == 'stats' and e['paused'])
+        revision = paused['pauseRevision']
+        send('multiplier', value=4)
+        worker = applied(4, True)
+        paused = wait(lambda e: e.get('event') == 'stats' and e.get('worker') == worker
+                      and e['pauseRevision'] == revision and e['paused'])
+        again = wait(lambda e: e.get('event') == 'stats' and e.get('worker') == worker)
+        assert again['paused'] and again['controllerPaused'], 'engine switch lost requested pause'
+        assert again['frames'] == paused['frames'], 'replacement kept rendering while paused'
+        assert all(e['controllerPaused'] for e in history
+                   if e.get('event') == 'stats' and e.get('controllerPauseRevision') == revision), \
+            'old worker telemetry overwrote requested pause'
+        send('pause', value=False)
+        resumed = wait(lambda e: e.get('event') == 'stats' and e.get('worker') == worker
+                       and e['pauseRevision'] > revision and not e['paused'] and e['frames'] > 5)
+        assert not resumed['controllerPaused']
+        print('PASS paused engine switch preserves pause and resumes the replacement', flush=True)
         # Rapid writes must coalesce to the latest request.
         send('multiplier', value=2); send('multiplier', value=4); send('multiplier', value=2)
         worker = applied(2, True)
@@ -140,6 +199,7 @@ def run():
         assert not any(alive(p) for p in workers), 'worker leaked after quit'
         print('PASS stop/restart/quit clean up all workers', flush=True)
     finally:
+        if controller is not None and alive(controller): os.kill(controller, signal.SIGTERM)
         if app is not None and app.poll() is None:
             app.terminate()
             try: app.wait(timeout=5)
@@ -147,6 +207,9 @@ def run():
         if source is not None and source.poll() is None: source.terminate(); source.wait(timeout=5)
         for pid in workers:
             if alive(pid): os.kill(pid, signal.SIGKILL)
+        if command_pipe is not None: command_pipe.close()
+        if 'reader' in locals(): reader.join(timeout=2)
+        ipc.cleanup()
         log.close()
         if saved.returncode == 0:
             with tempfile.NamedTemporaryFile(suffix='.plist') as f:

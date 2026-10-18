@@ -8,6 +8,7 @@ final class EngineSession {
     private let input = Pipe()
     private let output = Pipe()
     private let reader = DispatchQueue(label: "windowinterp.worker.events")
+    private let writer = DispatchQueue(label: "windowinterp.worker.commands.write")
     var onEvent: (([String: Any]) -> Void)?
     var onExit: ((Int32) -> Void)?
     var onDiagnostic: ((String) -> Void)?
@@ -32,6 +33,8 @@ final class EngineSession {
         try process.run()
         // The parent must close its extra write end or the reader never sees EOF.
         try? output.fileHandleForWriting.close()
+        // Otherwise a dead child still appears to have a reader and a full pipe never gets EPIPE.
+        try? input.fileHandleForReading.close()
         reader.async { [weak self, handle = output.fileHandleForReading] in
             var pending = Data()
             while true {
@@ -61,14 +64,17 @@ final class EngineSession {
         guard !stopping, process.isRunning,
               var data = try? JSONSerialization.data(withJSONObject: command) else { return }
         data.append(10)
-        try? input.fileHandleForWriting.write(contentsOf: data)
+        let payload = data
+        writer.async { [handle = input.fileHandleForWriting] in
+            try? handle.write(contentsOf: payload)
+        }
     }
 
     func stop() {
         guard !stopping else { return }
         send(["command": "stop"])
         stopping = true
-        try? input.fileHandleForWriting.close()
+        writer.async { [handle = input.fileHandleForWriting] in try? handle.close() }
         // Bound shutdown if an engine is blocked in present. Never block the UI.
         let process = process
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
