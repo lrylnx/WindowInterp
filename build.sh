@@ -1,9 +1,9 @@
 #!/bin/zsh
-# 构建「窗口插帧助手」。引擎资源来自本机已有的 LSFG 视频播放器 / MetalFrame。
+# 构建「窗口插帧助手」。WI_NATIVE_ONLY=1 跳过可选 LSFG 资源，适合原生版发布。
 set -eu
 cd "$(dirname "$0")"
 
-APP="$PWD/窗口插帧助手.app"
+APP="${WI_BUILD_APP:-$PWD/窗口插帧助手.app}"
 NAME="窗口插帧助手"
 
 # 引擎资源来源：可用 LSFGM_LSFG_SOURCES 覆盖（冒号分隔多个候选目录）
@@ -21,9 +21,19 @@ fi
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Native" "$APP/Contents/Resources/Tools"
 
 cp Info.plist "$APP/Contents/Info.plist"
+if [ "${WI_NATIVE_ONLY:-0}" = 1 ]; then
+    for F in liblsfg_metal.dylib liblsfg_extended.dylib libMoltenVK.dylib lsfg-vk.dll; do
+        if [ -e "$APP/Contents/Resources/Native/$F" ]; then
+            echo "❌ 原生发布目录含有旧引擎资源，请用 WI_BUILD_APP 指定干净目录。" >&2
+            exit 1
+        fi
+    done
+    /usr/libexec/PlistBuddy -c 'Set :LSMinimumSystemVersion 26.0' "$APP/Contents/Info.plist"
+fi
 
 # 引擎资源：liblsfg_metal / liblsfg_extended / libMoltenVK / lsfg-vk.dll
 COPIED=0
+if [ "${WI_NATIVE_ONLY:-0}" != 1 ]; then
 for SRC in "${ENGINE_SOURCES[@]}"; do
     [ -d "$SRC" ] || continue
     for F in liblsfg_metal.dylib liblsfg_extended.dylib libMoltenVK.dylib lsfg-vk.dll; do
@@ -35,13 +45,18 @@ if [ "$COPIED" -ne 1 ] && [ -s "$APP/Contents/Resources/Native/liblsfg_metal.dyl
     COPIED=1
     echo "→ 复用 App 内已有的 LSFG 引擎资源"
 fi
-if [ "$COPIED" -ne 1 ]; then
+fi
+if [ "$COPIED" -ne 1 ] && [ "${WI_REQUIRE_LSFG:-0}" = 1 ]; then
     echo "❌ 找不到 LSFG 引擎资源（liblsfg_metal.dylib / lsfg-vk.dll）。" >&2
     echo "   需要桌面上存在「LSFG 视频播放器.app」，或 MetalFrame.app。" >&2
     exit 1
 fi
-if [ ! -f "$APP/Contents/Resources/Native/liblsfg_extended.dylib" ]; then
+if [ "${WI_NATIVE_ONLY:-0}" != 1 ] && [ ! -f "$APP/Contents/Resources/Native/liblsfg_extended.dylib" ]; then
     echo "   （没有 liblsfg_extended.dylib：5× 以上倍率不可用）"
+fi
+
+if [ "$COPIED" -ne 1 ]; then
+    echo "→ 苹果原生 2× 构建，不需要 LSFG 二进制"
 fi
 
 # 图标（沿用播放器那份，缺就跳过）
@@ -84,8 +99,12 @@ done
 #    再往下（14.0/13.0）要先在 ScreenCaptureKit 那几个属性外面补 #available 守卫，
 #    没那个必要。
 #    架构固定 arm64：LSFG 引擎 dylib 只有 arm64，这App本来就只面向 Apple Silicon。
+BUILD_TEMP=$(mktemp -d /tmp/windowinterp-build.XXXXXX)
+trap 'rm -rf "$BUILD_TEMP"' EXIT
+xcrun clang -fobjc-arc -O2 -target arm64-apple-macos15.0 -c AppleVTBridge.m -o "$BUILD_TEMP/AppleVTBridge.o"
 env -u NODE_OPTIONS -u CODEBUDDY_BROKERED_FS_HOOK_ENABLED -u CODEBUDDY_SAFE_DELETE_SANDBOX \
-    xcrun swiftc -O -target arm64-apple-macos15.0 main.swift EngineSession.swift \
+    xcrun swiftc -O -target arm64-apple-macos15.0 main.swift EngineSession.swift AppleInterpolation.swift "$BUILD_TEMP/AppleVTBridge.o" \
+    -import-objc-header AppleVTBridge.h -framework VideoToolbox \
     -o "$APP/Contents/MacOS/WindowInterp" \
     -Xlinker -rpath -Xlinker @executable_path/../Resources/Native
 # 注意：不加 --options runtime —— Hardened Runtime 会拦下 DYLD_INSERT_LIBRARIES，
@@ -98,7 +117,7 @@ echo "✅ 构建完成：$APP"
 
 
 # 桌面上那份是日常双击用的副本（和播放器一样的习惯）
-if [ -d "$DESKTOP/窗口插帧助手.app" ]; then
+if [ "${WI_SYNC_DESKTOP:-1}" = 1 ] && [ -d "$DESKTOP/窗口插帧助手.app" ]; then
     ditto "$APP" "$DESKTOP/窗口插帧助手.app"
     echo "→ 已同步到 $DESKTOP/窗口插帧助手.app"
 fi

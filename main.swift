@@ -1,6 +1,6 @@
-// 窗口插帧助手 — ScreenCaptureKit → Core Image / Metal → LSFG → 穿透覆盖层。
-// 控制界面常驻；只有后台引擎进程注入 LSFG。引擎参数变化时先预热替代进程，
-// 确认真实生成帧后交接画面；锐化、角标与 Metal HUD 通过私有管道实时更新。
+// 窗口插帧助手 — ScreenCaptureKit → Apple VTLowLatencyFrameInterpolation 2× → Metal 覆盖层。
+// 控制界面常驻，后台进程管理捕获、插帧与呈现；--backend lsfg 保留旧路径。
+// 锐化、角标与 Metal HUD 通过私有管道实时更新。
 
 import AppKit
 import ApplicationServices
@@ -15,7 +15,7 @@ import Carbon.HIToolbox   // 系统级全局热键（RegisterEventHotKey）
 
 /// 版本标识 —— 「功能不好使」排查第一步永远是问版本（红线），所以把它打进
 /// 启动日志和菜单栏菜单头部，谁都能报出自己跑的是哪一版。
-let appVersion = "1.4.2"
+let appVersion = "1.5.2"
 
 // MARK: - 引擎注入（与 LSFG 视频播放器同一套路）
 
@@ -60,7 +60,9 @@ if let old = try? FileManager.default.contentsOfDirectory(at: logs,
     }
 }
 
-let supportedMultipliers = [2, 3, 4, 5, 6, 8, 10, 12]
+// Native Apple 2× is the default; --backend lsfg retains the previous diagnostic path.
+let appleBackend = argument("--backend") != "lsfg"
+let supportedMultipliers = appleBackend ? [2] : [2, 3, 4, 5, 6, 8, 10, 12]
 let isEngineWorker = hasFlag("--engine-worker")
 let usesEngineWorker = !isEngineWorker && !hasFlag("--in-process")
 let offMode = hasFlag("--off")
@@ -90,7 +92,7 @@ var multiplier = offMode ? 1 : manualMultiplier
 // 实测本工具 3× 插帧下 GPU 功耗 3.40 W → 0.99 W，**生成帧数一张不少**
 // （输出被 vblank 限住，省下的是纯算力）⇒ 笔记本上很值。默认关，界面上可勾。
 let flowScale = "1.0"
-var performanceMode = !hasFlag("--quality") && (hasFlag("--performance") || preferences.bool(forKey: "performanceMode"))
+var performanceMode = !appleBackend && !hasFlag("--quality") && (hasFlag("--performance") || preferences.bool(forKey: "performanceMode"))
 // 目标帧率默认 = 屏幕刷新率：生成帧超过这个数屏幕上根本显示不出来，算了也白算。
 let targetFPS: Int = {
     if let v = argument("--target-fps"), let n = Int(v), n > 0 { return n }
@@ -101,7 +103,7 @@ let targetFPS: Int = {
 }()
 
 // 注入只发生在引擎进程；控制窗口不会随引擎参数变化而重启。
-if !usesEngineWorker && getenv("WINDOW_INTERP_BOOT") == nil {
+if !appleBackend && !usesEngineWorker && getenv("WINDOW_INTERP_BOOT") == nil {
     setenv("WINDOW_INTERP_BOOT", "1", 1)
     if !offMode {
         let engine = multiplier > 4 ? "liblsfg_extended.dylib" : "liblsfg_metal.dylib"
@@ -745,6 +747,21 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
     private let renderQueue = DispatchQueue(label: "windowinterp.render", qos: .userInteractive)
     private let lock = NSLock()
 
+    private var appleStream: AppleInterpolationStream?
+    private var nativeScheduled = 0
+    private var nativeEpoch = 0
+    private var nativePresentedGenerated = 0
+    private var latestGenerated = false
+    private var latestDeadline = 0.0
+    private var displayedFPS = 0.0
+    private var displayedFrames = 0
+    private var displayWindowStart = 0.0
+    private var lastPresentedTime = 0.0
+    private var slowPresentations = 0
+    var displayFPS: Double { lock.withLock { CACurrentMediaTime() - lastPresentedTime < 2 ? displayedFPS : 0 } }
+    var presentationStalls: Int { lock.withLock { slowPresentations } }
+    var appleStats: (generated: Int, replaced: Int, processingMS: Double, size: CGSize, inputFPS: Double)? { appleStream?.stats }
+    var presentedGeneratedCount: Int { lock.withLock { nativePresentedGenerated } }
     private var latest: CIImage?
     private var renderScheduled = false
     private var stopped = false
@@ -755,7 +772,7 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
     private var measuredFPS: Double = 0
     private var lastFrameTime: Double = 0
     var frameCount: Int { lock.lock(); defer { lock.unlock() }; return renderedFrames }
-    var droppedCount: Int { lock.lock(); defer { lock.unlock() }; return replacedFrames }
+    var droppedCount: Int { lock.withLock { replacedFrames } + (appleStream?.stats.replaced ?? 0) }
     var feedFPS: Double {
         lock.lock(); defer { lock.unlock() }
         return CACurrentMediaTime() - lastFrameTime < 2 ? measuredFPS : 0
@@ -834,6 +851,24 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     @MainActor func start(filter: SCContentFilter, targetWindowID: CGWindowID, width: Int, height: Int, captureFPS: Double) async throws {
+        if appleBackend && !offMode {
+            guard WIAppleSupported() else { throw AppleFrameInterpolator.error("当前系统或芯片不支持苹果低延迟插帧，需要 macOS 26 或更新系统") }
+            let nativeStream = AppleInterpolationStream()
+            nativeStream.onOutput = { [weak self] image, deadline, generated in
+                self?.scheduleNative(image, deadline: deadline, generated: generated)
+            }
+            nativeStream.onError = { [weak self] message in self?.onFatal?(message) }
+            nativeStream.onTimelineReset = { [weak self] in
+                guard let self else { return }
+                self.lock.withLock { self.nativeEpoch += 1; self.latest = nil }
+            }
+            nativeStream.onConfiguration = { [weak self] text in
+                guard let self else { return }
+                self.lock.withLock { self.nativeEpoch += 1; self.latest = nil }
+                logLine(text)
+            }
+            appleStream = nativeStream
+        }
         let config = makeConfiguration(width: width, height: height, captureFPS: captureFPS)
         configuredSize = CGSize(width: width, height: height)
         configuredFPS = captureFPS
@@ -860,7 +895,7 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
         config.scalesToFit = false
         config.preservesAspectRatio = true
         config.capturesAudio = false
-        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(captureFPS))
+        config.minimumFrameInterval = CMTime(seconds: 1 / captureFPS, preferredTimescale: 60_000)
         config.captureResolution = .best
         config.ignoreShadowsSingleWindow = true
         config.includeChildWindows = false
@@ -871,6 +906,7 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
     @MainActor func stop() {
         sizeUpdateTask?.cancel(); sizeUpdateTask = nil; pendingSizeUpdate = nil
         lock.lock(); stopped = true; latest = nil; capturedImage = nil; lock.unlock()
+        appleStream?.stop()
         diagTimer?.cancel(); diagTimer = nil
         if let stream { Task { try? await stream.stopCapture() } }
         stream = nil
@@ -922,6 +958,10 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
             statLock.lock(); lastLuma = luma; statLock.unlock()
         }
 
+        if let appleStream {
+            appleStream.submit(buffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+            return
+        }
         let image = CIImage(cvPixelBuffer: buffer)
         lock.lock()
         guard !stopped else { lock.unlock(); return }
@@ -931,6 +971,34 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
         renderScheduled = true
         lock.unlock()
         if needSchedule { renderQueue.async { [weak self] in self?.drain() } }
+    }
+
+    // Bound retained IOSurfaces and reject stale output instead of accumulating delay.
+    private func scheduleNative(_ image: CIImage, deadline: Double, generated: Bool) {
+        lock.lock()
+        guard !stopped, nativeScheduled < 16 else {
+            replacedFrames += 1; lock.unlock(); return
+        }
+        nativeScheduled += 1
+        let epoch = nativeEpoch
+        lock.unlock()
+        renderQueue.asyncAfter(deadline: .now() + max(0, deadline - CACurrentMediaTime() - 0.004)) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            self.nativeScheduled -= 1
+            guard !self.stopped, epoch == self.nativeEpoch,
+                  CACurrentMediaTime() - deadline < 0.05 else {
+                self.replacedFrames += 1; self.lock.unlock(); return
+            }
+            if self.latest != nil { self.replacedFrames += 1 }
+            self.latest = image
+            self.latestGenerated = generated
+            self.latestDeadline = deadline
+            let needsDrain = !self.renderScheduled
+            self.renderScheduled = true
+            self.lock.unlock()
+            if needsDrain { self.drain() }
+        }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -972,9 +1040,14 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
             return
         }
         // nextDrawable 也可能等垂直同步；拿到真正可写的 drawable 后才取最新帧。
+        var frameGenerated = false
+        var frameDeadline = 0.0
         let frame: CIImage? = lock.withLock {
             guard !stopped else { return nil }
             let image = latest
+            frameGenerated = latestGenerated
+            frameDeadline = latestDeadline
+            latestGenerated = false
             latest = nil
             capturedImage = image
             return image
@@ -1085,7 +1158,15 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
         } else {
             context.render(transformed, to: drawable.texture, commandBuffer: command, bounds: bounds, colorSpace: colorSpace)
         }
-        command.present(drawable)
+        if appleStream != nil {
+            let generated = frameGenerated
+            drawable.addPresentedHandler { [weak self] shown in
+                self?.recordNativePresentation(shown.presentedTime, generated: generated)
+            }
+            command.present(drawable, atTime: max(CACurrentMediaTime(), frameDeadline))
+        } else {
+            command.present(drawable)
+        }
         submitted = true
         command.commit()
         if !firstFrameSent {
@@ -1104,6 +1185,21 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
             fpsWindowFrames = 0; fpsWindowStart = now
         }
         lock.unlock()
+    }
+
+    private func recordNativePresentation(_ time: Double, generated: Bool) {
+        guard time > 0 else { return }
+        lock.lock(); defer { lock.unlock() }
+        guard !stopped else { return }
+        if generated { nativePresentedGenerated += 1 }
+        if lastPresentedTime > 0, time - lastPresentedTime > 1.5 / Double(targetFPS) { slowPresentations += 1 }
+        lastPresentedTime = time
+        if displayWindowStart == 0 { displayWindowStart = time }
+        displayedFrames += 1
+        if time - displayWindowStart >= 1 {
+            displayedFPS = Double(displayedFrames) / (time - displayWindowStart)
+            displayedFrames = 0; displayWindowStart = time
+        }
     }
 
     // MARK: 诊断
@@ -1375,7 +1471,7 @@ final class FirstMouseButton: NSButton {
     /// 只会牺牲画面整齐度，所以固定开启。
     var displaySync = true
     // 诊断用：关掉「面板物理像素」封顶，用来复现旧版本的工作分辨率做对比测量。
-    var ignorePixelCap = hasFlag("--ignore-pixel-cap")
+    var ignorePixelCap = !hasFlag("--limit-capture-pixels")
     var showBadge = UserDefaults.standard.object(forKey: "showBadge") == nil ? true : UserDefaults.standard.bool(forKey: "showBadge")
     // 输出到 CAMetalLayer 时要不要在显示边界翻转一次 —— 取决于**引擎在不在**。
     //
@@ -1388,7 +1484,7 @@ final class FirstMouseButton: NSButton {
     // 「引擎在 = 正立」是 1.1.0 之前就成立的行为，`--off` 一直是倒的、长期无人发现。
     //
     // 两条路径都成立 —— 所以它必须在两侧取相反的值。
-    var displayFlip: Bool { !offMode }
+    var displayFlip: Bool { !appleBackend && !offMode }
     var statTimer: Timer?
     var refreshTimer: Timer?
     /// 正在被插帧的那个窗口 id（用于检测它是否还在当前 Space）。
@@ -1606,7 +1702,9 @@ final class FirstMouseButton: NSButton {
 
         perfModeCheck = NSButton(checkboxWithTitle: "性能模式", target: self, action: #selector(perfModeChanged(_:)))
         perfModeCheck.state = performanceMode ? .on : .off
-        perfModeCheck.toolTip = "使用轻量着色器降低 GPU 开销；后台切换引擎，控制窗口保持打开。"
+        perfModeCheck.toolTip = appleBackend ? "苹果原生 2× 使用独立插帧处理器，此项仅适用于 LSFG。" : "使用轻量着色器降低 GPU 开销；后台切换引擎，控制窗口保持打开。"
+        perfModeCheck.isEnabled = !appleBackend
+        if appleBackend { perfModeCheck.title = "苹果原生 2×"; perfModeCheck.state = .on }
         let badgeCheck = NSButton(checkboxWithTitle: "显示右上角插帧角标", target: self, action: #selector(badgeChanged))
         badgeCheck.state = showBadge ? .on : .off
         badgeCheck.toolTip = "鼠标静止 3 秒后隐藏，在输出区域移动后恢复。"
@@ -2008,7 +2106,7 @@ final class FirstMouseButton: NSButton {
                 logLine("start: SCStream 已启动")
                 self.running = true
                 self.startButton.title = "停止插帧"
-                let modeText = offMode ? "原帧模式" : "LSFG \(multiplier)×"
+                let modeText = offMode ? "原帧模式" : (appleBackend ? "苹果原生 2×" : "LSFG \(multiplier)×")
                 self.statusLabel.stringValue = "插帧中 · 采集 \(captureWidth)×\(captureHeight) @\(Int(fps))fps · \(modeText)"
                 self.hintLabel.stringValue = "正在插帧 · 鼠标静止 3 秒后隐藏悬浮控件"
                 logLine("start: ok target=\(target.windowID) \(target.appName) capture=\(captureWidth)x\(captureHeight) fps=\(Int(fps)) mode=\(self.mode) off=\(offMode)")
@@ -2806,19 +2904,9 @@ final class FirstMouseButton: NSButton {
                       height: screen.frame.height * screen.backingScaleFactor)
     }
 
-    /// 源矩形 → **采集尺寸 = 渲染尺寸**（drawable 的像素尺寸）。两者**恒等**，没有第二套概念。
-    ///
-    /// ⚠️ 这里曾经还有个 `plannedOutputSize` / `resolveOutputSize`（"输出尺寸与采集解耦"），
-    /// 是给 `--output-scale fill` 用的。它唯一能起作用的场合是「刻意压低采集、再把画面
-    /// 放大回去」（= 小黄鸭那个 FSR 档的前提），而本工具**不做那档**（只保留贴源覆盖层，
-    /// 第十三轮定的），所以那套东西**永远不生效**、已在 2026-10-16 连同 MetalFX 档一起删掉
-    /// （见 `ReconstructMode` 的注释 / `dev/开发笔记.md` 第二十三轮 / 红线 119）。
-    ///
-    /// 两个约束同时生效：
-    ///   ① 不超过显示器物理像素（见 `physicalPixelSize`）—— 「更多空间」这类缩放模式下
-    ///      「逻辑点 ×2」比面板真实像素多 1.7 倍，不封顶就是让引擎白烧电；
-    ///   ② `workResolution > 0` 时按高度封顶（**当前是常量 0**：那个设置项已不提供，
-    ///      留着只是因为这正是当年"输出/采集解耦"的驱动源，写明白省得后人再摸一遍）。
+    /// Capture and drawable follow the full Retina backing raster by default.
+    /// Panel capping would downsample here and let WindowServer scale up again.
+    /// --limit-capture-pixels retains the old lower-cost diagnostic path.
     func plannedCaptureSize(for cgFrame: CGRect) -> CGSize {
         let scale = scaleFactor(for: cgFrame)
         var w = cgFrame.width * scale
@@ -2847,9 +2935,8 @@ final class FirstMouseButton: NSButton {
     ///
     /// 引擎按「源帧率 × 倍率」出帧，超出屏幕刷新率的部分**根本显示不出来**。
     /// 60Hz 屏 + 2× 时源只要能到 30fps 就够，多采的帧等于让引擎白算一遍。
-    /// 源本身只有 24/30fps 时 SCK 不会凭空多送帧，所以压低这个上限没有副作用。
-    /// 下限取 24：比常见视频帧率还低会真的丢源帧，那时宁可多烧一点也别把画面弄卡。
-    var effectiveCaptureFPS: Double { 60 }
+    /// 这是捕获上限；实际仍由源窗口和 WindowServer 决定。高帧率源也会被采样到该上限。
+    var effectiveCaptureFPS: Double { appleBackend && !offMode ? max(1, min(60, Double(targetFPS) / 2)) : 60 }
 
     /// 端到端延迟估计（毫秒）—— 不是拍脑袋，是 `dev/lat-round.sh`（扫描条相对位置法）
     /// 实测出来的。两套实测（Apple M4 / 光流 0.5 / queueDepth 3 / 工作分辨率 400p）：
@@ -2886,7 +2973,7 @@ final class FirstMouseButton: NSButton {
     }
 
     var estimatedLatencyMS: Double? {
-        guard !offMode else { return nil }
+        guard !offMode, !appleBackend else { return nil }
         return Self.latencyEstimateMS(multiplier: multiplier, refreshRate: refreshRate)
     }
 
@@ -2904,6 +2991,7 @@ final class FirstMouseButton: NSButton {
 
     /// 「约 185ms 延迟」这种给人看的短句
     static func latencyLabel(multiplier m: Int, refreshRate hz: Double) -> String {
+        guard !appleBackend else { return "" }
         guard let ms = latencyEstimateMS(multiplier: m, refreshRate: hz) else { return "" }
         return " · 约 \(Int(ms.rounded()))ms 延迟"
     }
@@ -2911,6 +2999,7 @@ final class FirstMouseButton: NSButton {
     // MARK: 功耗相关选项
 
     @objc func togglePerfMode() {
+        guard !appleBackend else { return }
         let on = !performanceMode
         preferences.set(on, forKey: "performanceMode")
         perfModeCheck.state = on ? .on : .off
@@ -2986,7 +3075,7 @@ final class FirstMouseButton: NSButton {
         }
         add("抓取方式", nil).submenu = modes
         menu.addItem(.separator())
-        add("性能模式", #selector(togglePerfMode), checked: performanceMode)
+        if !appleBackend { add("性能模式", #selector(togglePerfMode), checked: performanceMode) }
         add("显示右上角插帧角标", #selector(toggleBadge), checked: showBadge)
         add("Metal HUD", #selector(toggleMetalHUD), checked: metalHUDEnabled)
         if !CGPreflightScreenCaptureAccess() {
@@ -3044,8 +3133,8 @@ final class FirstMouseButton: NSButton {
     func tickStatus() {
         if usesEngineWorker {
             if running && pendingSession == nil {
-                statusLabel.stringValue = paused ? "⏸ 已暂停" : String(format: "%d× · 采集 %.1f fps · 已渲染 %d · 丢弃过期帧 %d", appliedMultiplier, remoteFPS, remoteFrames, remoteDropped)
-                if engineOutFPS > 0 { statusLabel.stringValue += String(format: " · 估计输出 %.0f fps", engineOutFPS) }
+                statusLabel.stringValue = paused ? "⏸ 已暂停" : String(format: "%d× · 呈现 %.1f fps · 已渲染 %d · 丢弃过期帧 %d", appliedMultiplier, remoteFPS, remoteFrames, remoteDropped)
+                if engineOutFPS > 0 && !appleBackend { statusLabel.stringValue += String(format: " · 估计输出 %.0f fps", engineOutFPS) }
                 if !settingsError.isEmpty { statusLabel.stringValue += " · ⚠️ 设置未应用：" + settingsError }
             }
             statusItem?.button?.title = running ? "⚡\(appliedMultiplier)×" : "⚡︎"
@@ -3054,12 +3143,20 @@ final class FirstMouseButton: NSButton {
         guard running else { return }
         var parts: [String] = []
         if let p = pipeline {
-            parts.append(String(format: "采集 %.1f fps", p.feedFPS))
+            parts.append(String(format: appleBackend && !offMode ? "呈现 %.1f fps" : "采集 %.1f fps", appleBackend && !offMode ? p.displayFPS : p.feedFPS))
             parts.append("已渲染 \(p.frameCount)")
             if p.droppedCount > 0 { parts.append("丢 \(p.droppedCount)") }
         }
         parts.append(String(format: "屏 %.0fHz", refreshRate))
-        if !offMode, let text = tailOfFile(engineLog) {
+        if appleBackend, !offMode, let p = pipeline, let stats = p.appleStats {
+            lastEngineGenerated = p.presentedGeneratedCount
+            engineOutFPS = p.displayFPS
+            engineSrcFPS = stats.inputFPS
+            lastEngineStamp = CACurrentMediaTime()
+            parts.append(String(format: "苹果 2× · 已显示中间帧 %d · 处理 %.1fms · 工作 %d×%d",
+                                lastEngineGenerated, stats.processingMS, Int(stats.size.width), Int(stats.size.height)))
+        }
+        if !appleBackend, !offMode, let text = tailOfFile(engineLog) {
             let line = text.components(separatedBy: "\n").last(where: { $0.contains("Frame generation stats") }) ?? ""
             if !line.isEmpty, line != lastEngineLine {
                 func count(_ name: String) -> Int {
@@ -3106,7 +3203,7 @@ final class FirstMouseButton: NSButton {
                 let rate: String = {
                     if offMode { return "\(Int(pipeline?.feedFPS ?? 0))fps" }
                     if engineOutFPS > 1 && CACurrentMediaTime() - lastEngineStamp < 4 {
-                        return String(format: "源 %.0f → 估计 %.0ffps", engineSrcFPS, engineOutFPS)
+                        return String(format: appleBackend ? "呈现 %.0ffps" : "源 %.0f → 估计 %.0ffps", appleBackend ? engineOutFPS : engineSrcFPS, engineOutFPS)
                     }
                     return "\(Int(pipeline?.feedFPS ?? 0))fps"
                 }()
@@ -3123,7 +3220,7 @@ final class FirstMouseButton: NSButton {
                 ? (offMode ? "原帧 · \(Int(pipeline?.feedFPS ?? 0))fps"
                            : (paused ? "⏸ 已暂停（⌃⌥P 继续）"
                                      : (engineOutFPS > 1 && CACurrentMediaTime() - lastEngineStamp < 4
-                                        ? String(format: "%@ · 源 %.0f → 估计输出 %.0f fps", multiplierLabel, engineSrcFPS, engineOutFPS)
+                                        ? (appleBackend ? String(format: "苹果 2× · 呈现 %.0f fps", engineOutFPS) : String(format: "%@ · 源 %.0f → 估计输出 %.0f fps", multiplierLabel, engineSrcFPS, engineOutFPS))
                                         : "\(multiplierLabel) · 采集 \(Int(pipeline?.feedFPS ?? 0))fps · 等待引擎统计")))
                 : "已停止"
         }
@@ -3136,8 +3233,13 @@ final class FirstMouseButton: NSButton {
         if isEngineWorker {
             reportWorkerReadiness()
             emitWorkerEvent(["event": "stats", "frames": pipeline?.frameCount ?? 0,
-                             "dropped": pipeline?.droppedCount ?? 0, "fps": pipeline?.feedFPS ?? 0,
-                             "outputFPS": engineOutFPS, "paused": paused, "pauseRevision": pauseRevision])
+                             "dropped": pipeline?.droppedCount ?? 0, "fps": (appleBackend && !offMode ? pipeline?.displayFPS : pipeline?.feedFPS) ?? 0,
+                             "outputFPS": engineOutFPS, "generated": pipeline?.presentedGeneratedCount ?? 0,
+                             "sourceFPS": engineSrcFPS, "presentationStalls": pipeline?.presentationStalls ?? 0,
+                             "captureWidth": Int(pipeline?.renderSize.width ?? 0), "captureHeight": Int(pipeline?.renderSize.height ?? 0),
+                             "workWidth": Int(pipeline?.appleStats?.size.width ?? 0), "workHeight": Int(pipeline?.appleStats?.size.height ?? 0),
+                             "processingMS": pipeline?.appleStats?.processingMS ?? 0,
+                             "backend": appleBackend ? "apple" : "lsfg", "paused": paused, "pauseRevision": pauseRevision])
         }
 
     }
@@ -3211,7 +3313,7 @@ extension AppDelegate {
 
     func reportWorkerReadiness() {
         guard isEngineWorker, workerHasFrame, !workerReportedReady,
-              offMode || lastEngineGenerated > 0 else { return }
+              offMode || (appleBackend ? workerHasFrame : lastEngineGenerated > 0) else { return }
         workerReportedReady = true
         emitWorkerEvent(["event": "ready", "window": interpWindow?.windowNumber ?? 0])
     }
@@ -3282,9 +3384,10 @@ extension AppDelegate {
                     performanceMode ? "--performance" : "--quality",
                     "--reconstruct", reconstruct.rawValue, "--reconstruct-sharp", String(sharpenAmount),
                     "--target-fps", String(targetFPS)]
+        args += ["--backend", appleBackend ? "apple" : "lsfg"]
         if offMode { args.append("--off") }
         for flag in ["--test-window", "--native-fullscreen", "--ignore-pixel-cap", "--diagnostics",
-                     "--reconstruct-thru-mid", "--solid", "--no-space-switch"] where hasFlag(flag) { args.append(flag) }
+                     "--reconstruct-thru-mid", "--solid", "--no-space-switch", "--limit-capture-pixels"] where hasFlag(flag) { args.append(flag) }
         for key in ["--test-x", "--test-y", "--test-w", "--test-h", "--queue-depth", "--drawable-count",
                     "--overlay-alpha", "--dump-output"] {
             if let value = argument(key) { args += [key, value] }
@@ -3325,6 +3428,7 @@ extension AppDelegate {
                         self.rebuildStatusMenu()
                         if hasFlag("--control-stdin") {
                             emitWorkerEvent(["event": "applied", "controller": getpid(), "worker": session.pid,
+                                             "backend": appleBackend ? "apple" : "lsfg",
                                              "multiplier": requestedMultiplier, "performance": requestedPerformance,
                                              "mode": requestedMode.rawValue])
                         }
@@ -3398,7 +3502,7 @@ extension AppDelegate {
             preferences.set(performanceMode, forKey: "performanceMode")
             preferences.set(mode.rawValue, forKey: "mode")
             multiplierPopup.selectItem(at: supportedMultipliers.firstIndex(of: multiplier) ?? 0)
-            perfModeCheck.state = performanceMode ? .on : .off
+            perfModeCheck.state = appleBackend || performanceMode ? .on : .off
             modePopup.selectItem(at: mode.rawValue)
         }
         startButton.title = running ? "停止插帧" : "开始插帧"
@@ -3415,6 +3519,7 @@ extension AppDelegate {
             switch name {
             case "multiplier": applyEngineSettings(multiplier: command["value"] as? Int ?? 2)
             case "performance":
+                guard !appleBackend else { return }
                 performanceMode = command["value"] as? Bool ?? false
                 preferences.set(performanceMode, forKey: "performanceMode")
                 perfModeCheck.state = performanceMode ? .on : .off

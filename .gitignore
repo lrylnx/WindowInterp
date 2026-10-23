@@ -34,3 +34,6 @@ dev/verification-*/
 
 # 本机验证截图现场（部分含个人工作画面，不进仓库）
 validation/
+
+# Native Apple verification products
+dev/native-verification/
