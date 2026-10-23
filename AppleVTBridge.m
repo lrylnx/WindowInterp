@@ -21,9 +21,13 @@ BOOL WIAppleSupported(void) {
     return c && [c respondsToSelector:@selector(isSupported)] && [(id<WIAppleRuntime>)c isSupported];
 }
 NSObject *WIAppleConfiguration(NSInteger w, NSInteger h) {
-    if (!WIAppleSupported()) return nil;
+    return WIAppleConfigurationForMultiplier(w, h, 2);
+}
+NSObject *WIAppleConfigurationForMultiplier(NSInteger w, NSInteger h, NSInteger multiplier) {
+    if (!WIAppleSupported() || (multiplier != 2 && multiplier != 4)) return nil;
+    // Apple defines a depth: 1 exposes 0.5; 2 exposes 0.25, 0.5, 0.75.
     return (NSObject *)[(id<WIAppleRuntime>)[NSClassFromString(@"VTLowLatencyFrameInterpolationConfiguration") alloc]
-        initWithFrameWidth:w frameHeight:h numberOfInterpolatedFrames:1];
+        initWithFrameWidth:w frameHeight:h numberOfInterpolatedFrames:(multiplier == 4 ? 2 : 1)];
 }
 NSDictionary *WIAppleAttributes(NSObject *c, BOOL d) {
     return d ? [(id<WIAppleRuntime>)c destinationPixelBufferAttributes] : [(id<WIAppleRuntime>)c sourcePixelBufferAttributes];
@@ -34,14 +38,24 @@ NSError *WIAppleStart(NSObject *p, NSObject *c) {
     return [(id<WIAppleRuntime>)p startSessionWithConfiguration:c error:&e] ? nil : (e ?: WIError(@"苹果插帧会话启动失败"));
 }
 NSError *WIAppleInterpolate(NSObject *p, CVPixelBufferRef a, CMTime at, CVPixelBufferRef b, CMTime bt, CVPixelBufferRef d) {
+    return WIAppleInterpolateFrames(p, a, at, b, bt, (__bridge CFArrayRef)@[(__bridge id)d]);
+}
+NSError *WIAppleInterpolateFrames(NSObject *p, CVPixelBufferRef a, CMTime at, CVPixelBufferRef b, CMTime bt, CFArrayRef destinations) {
     Class frame = NSClassFromString(@"VTFrameProcessorFrame");
-    CMTime mt = CMTimeAdd(at, CMTimeMultiplyByFloat64(CMTimeSubtract(bt, at), 0.5));
     id af = [(id<WIAppleRuntime>)[frame alloc] initWithBuffer:a presentationTimeStamp:at];
     id bf = [(id<WIAppleRuntime>)[frame alloc] initWithBuffer:b presentationTimeStamp:bt];
-    id df = [(id<WIAppleRuntime>)[frame alloc] initWithBuffer:d presentationTimeStamp:mt];
-    if (!af || !bf || !df) return WIError(@"苹果插帧无法创建输入或输出帧");
+    NSArray *buffers = (__bridge NSArray *)destinations;
+    if (!af || !bf || (buffers.count != 1 && buffers.count != 3)) return WIError(@"苹果插帧无法创建输入或输出帧");
+    NSMutableArray *frames = [NSMutableArray array], *phases = [NSMutableArray array];
+    for (NSUInteger i = 0; i < buffers.count; i++) {
+        double phase = (double)(i + 1) / (buffers.count + 1);
+        CMTime time = CMTimeAdd(at, CMTimeMultiplyByFloat64(CMTimeSubtract(bt, at), phase));
+        id f = [(id<WIAppleRuntime>)[frame alloc] initWithBuffer:(__bridge CVPixelBufferRef)buffers[i] presentationTimeStamp:time];
+        if (!f) return WIError(@"苹果插帧无法创建输出帧");
+        [frames addObject:f]; [phases addObject:@(phase)];
+    }
     id params = [(id<WIAppleRuntime>)[NSClassFromString(@"VTLowLatencyFrameInterpolationParameters") alloc]
-        initWithSourceFrame:bf previousFrame:af interpolationPhase:@[@0.5] destinationFrames:@[df]];
+        initWithSourceFrame:bf previousFrame:af interpolationPhase:phases destinationFrames:frames];
     if (!params) return WIError(@"苹果插帧参数不支持当前尺寸或格式");
     __block NSError *error = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);

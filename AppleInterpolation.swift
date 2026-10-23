@@ -6,7 +6,7 @@ import VideoToolbox
 import QuartzCore
 
 /// One serial owner, including all conversions and session teardown.
-/// Uses exactly one midpoint request, as in frameinterp/gpu/player/PlayerCore.swift.
+/// Requests uniformly spaced native phases in one processor call.
 final class AppleFrameInterpolator {
     private var processor: NSObject?
     private var inputPool: CVPixelBufferPool?
@@ -15,14 +15,18 @@ final class AppleFrameInterpolator {
     private var transfer: VTPixelTransferSession?
     private(set) var size = CGSize.zero
 
-    init(width: Int, height: Int) throws {
+    private let multiplier: Int
+
+    init(width: Int, height: Int, multiplier: Int = 2) throws {
+        guard [2, 4].contains(multiplier) else { throw Self.error("苹果原生支持 2× 或 4×") }
+        self.multiplier = multiplier
         guard WIAppleSupported() else { throw Self.error("此系统或芯片不支持苹果低延迟插帧，需要 macOS 26 或更新系统") }
         // A conservative 720p processing budget. Originals remain at capture resolution.
         // Not a hardware limit; avoids probing arbitrary large window sizes during playback.
         let scale = min(1, sqrt(921_600 / Double(width * height)))
         let w = max(64, Int(Double(width) * scale) / 16 * 16)
         let h = max(64, Int(Double(height) * scale) / 16 * 16)
-        guard let config = WIAppleConfiguration(w, h), let p = WIAppleProcessor() else {
+        guard let config = WIAppleConfigurationForMultiplier(w, h, multiplier), let p = WIAppleProcessor() else {
             throw Self.error("无法创建苹果低延迟插帧配置")
         }
         if let error = WIAppleStart(p, config) { throw error }
@@ -59,11 +63,11 @@ final class AppleFrameInterpolator {
         return pool
     }
 
-    private func buffer(_ pool: CVPixelBufferPool?) throws -> CVPixelBuffer {
+    private func buffer(_ pool: CVPixelBufferPool?, limit: Int = 12) throws -> CVPixelBuffer {
         var buffer: CVPixelBuffer?
         guard let pool,
               CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, pool,
-                [kCVPixelBufferPoolAllocationThresholdKey as String: 12] as CFDictionary, &buffer) == kCVReturnSuccess,
+                [kCVPixelBufferPoolAllocationThresholdKey as String: limit] as CFDictionary, &buffer) == kCVReturnSuccess,
               let buffer else { throw Self.error("苹果插帧缓冲池已满") }
         return buffer
     }
@@ -104,10 +108,18 @@ final class AppleFrameInterpolator {
 
     func midpoint(previous: CVPixelBuffer, previousPTS: CMTime,
                   current: CVPixelBuffer, currentPTS: CMTime) throws -> CVPixelBuffer {
-        let destination = try buffer(outputPool)
+        guard multiplier == 2 else { throw Self.error("midpoint 仅适用于 2× 会话") }
+        return try intermediates(previous: previous, previousPTS: previousPTS, current: current, currentPTS: currentPTS)[0]
+    }
+
+    func intermediates(previous: CVPixelBuffer, previousPTS: CMTime,
+                       current: CVPixelBuffer, currentPTS: CMTime) throws -> [CVPixelBuffer] {
+        // Up to 16 scheduled outputs plus the active triple and in-flight renders.
+        // Keep the pool bounded, with enough headroom for 144Hz delayed playout.
+        let destinations = try (1..<multiplier).map { _ in try buffer(outputPool, limit: multiplier == 4 ? 24 : 12) }
         guard let processor else { throw Self.error("苹果插帧会话未启动") }
-        if let error = WIAppleInterpolate(processor, previous, previousPTS, current, currentPTS, destination) { throw error }
-        return destination
+        if let error = WIAppleInterpolateFrames(processor, previous, previousPTS, current, currentPTS, destinations as CFArray) { throw error }
+        return destinations
     }
 }
 
@@ -176,6 +188,10 @@ final class StaticDetailPreserver {
 final class AppleInterpolationStream {
     private let queue = DispatchQueue(label: "windowinterp.apple.interpolation", qos: .userInteractive)
     private let lock = NSLock()
+    private let multiplier: Int
+
+    init(multiplier: Int = 2) { self.multiplier = multiplier }
+
     private let detailPreserver = StaticDetailPreserver()
     private var pending: (CVPixelBuffer, CMTime)?
     private var busy = false
@@ -241,7 +257,7 @@ final class AppleInterpolationStream {
                 catch {
                     lock.lock(); stopped = true; pending = nil; lock.unlock()
                     previous = nil; engine = nil
-                    onError?("苹果 2× 插帧失败：\(error.localizedDescription)")
+                    onError?("苹果 \(multiplier)× 插帧失败：\(error.localizedDescription)")
                 }
             }
         }
@@ -260,10 +276,10 @@ final class AppleInterpolationStream {
         let dimensions = CGSize(width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer))
         if dimensions != sourceSize {
             previous = nil; engine = nil
-            engine = try AppleFrameInterpolator(width: Int(dimensions.width), height: Int(dimensions.height))
+            engine = try AppleFrameInterpolator(width: Int(dimensions.width), height: Int(dimensions.height), multiplier: multiplier)
             sourceSize = dimensions
             lock.lock(); workSize = engine!.size; lock.unlock()
-            onConfiguration?("Apple VTLowLatencyFrameInterpolation 2× · 采集 \(Int(dimensions.width))×\(Int(dimensions.height)) · 插帧 \(Int(engine!.size.width))×\(Int(engine!.size.height))")
+            onConfiguration?("Apple VTLowLatencyFrameInterpolation \(multiplier)× · 采集 \(Int(dimensions.width))×\(Int(dimensions.height)) · 插帧 \(Int(engine!.size.width))×\(Int(engine!.size.height))")
         }
         guard let engine else { return }
         let original = try engine.copyOriginal(buffer)
@@ -283,7 +299,7 @@ final class AppleInterpolationStream {
             return
         }
         let started = CACurrentMediaTime()
-        let middle = try engine.midpoint(previous: old.converted, previousPTS: old.pts, current: converted, currentPTS: pts)
+        let middles = try engine.intermediates(previous: old.converted, previousPTS: old.pts, current: converted, currentPTS: pts)
         let elapsed = CACurrentMediaTime() - started
         lock.lock(); let cancelled = stopped; lock.unlock()
         guard !cancelled else { return }
@@ -292,17 +308,19 @@ final class AppleInterpolationStream {
         // turn that one-off cost into a permanent deep queue and recurring drops.
         if firstPair { delay = max(0.075, min(0.1, interval + 0.025)) }
         let due = anchorHost + old.pts.seconds - anchorPTS + delay
-        if due + interval / 2 < CACurrentMediaTime() - 0.02 {
+        if due + interval / Double(multiplier) < CACurrentMediaTime() - 0.02 {
             anchorPTS = timestamp; anchorHost = hostAnchor(for: timestamp); firstPair = true
             onTimelineReset?()
             onOutput?(CIImage(cvPixelBuffer: original), CACurrentMediaTime(), false)
             return
         }
-        lock.lock(); generated += 1; processingMS = elapsed * 1000; lock.unlock()
+        lock.lock(); generated += middles.count; processingMS = elapsed * 1000; lock.unlock()
         if firstPair { onOutput?(CIImage(cvPixelBuffer: old.original), due, false); firstPair = false }
-        let detailed = try detailPreserver.preserve(previous: CIImage(cvPixelBuffer: old.original),
-            current: CIImage(cvPixelBuffer: original), middle: AppleFrameInterpolator.displayImage(middle, canvas: dimensions))
-        onOutput?(detailed, due + interval / 2, true)
+        for (index, middle) in middles.enumerated() {
+            let detailed = try detailPreserver.preserve(previous: CIImage(cvPixelBuffer: old.original),
+                current: CIImage(cvPixelBuffer: original), middle: AppleFrameInterpolator.displayImage(middle, canvas: dimensions))
+            onOutput?(detailed, due + interval * Double(index + 1) / Double(multiplier), true)
+        }
         // A final B must still appear if the source becomes idle after this pair.
         onOutput?(CIImage(cvPixelBuffer: original), due + interval, false)
     }

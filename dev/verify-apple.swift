@@ -100,6 +100,38 @@ import QuartzCore
                          width, height, engine.size.width, engine.size.height,
                          samples[samples.count/2], samples[Int(Double(samples.count-1)*0.95)], da, db))
         }
+        // Native 4× must produce three distinct, temporally ordered phases.
+        for (width, height) in [(640, 360), (2560, 1440)] {
+            let engine = try AppleFrameInterpolator(width: width, height: height, multiplier: 4)
+            let a = try engine.convert(source(width: width, height: height, x: width/4))
+            let b = try engine.convert(source(width: width, height: height, x: width/4 + width/12))
+            var samples: [Double] = []
+            var frames: [CVPixelBuffer] = []
+            for i in 0..<25 {
+                let start = CACurrentMediaTime()
+                frames = try engine.intermediates(previous: a, previousPTS: CMTime(value: Int64(i), timescale: 36),
+                    current: b, currentPTS: CMTime(value: Int64(i+1), timescale: 36))
+                if i >= 5 { samples.append((CACurrentMediaTime()-start)*1000) }
+            }
+            precondition(frames.count == 3)
+            let rasters = ([a] + frames + [b]).map { bytes($0, width: 320, height: 180) }
+            func center(_ raster: [UInt8]) -> Double {
+                var sum = 0.0, weight = 0.0
+                for y in 50..<130 { for x in 0..<320 {
+                    let value = max(0, Double(raster[(y*320+x)*4])-100)
+                    sum += Double(x)*value; weight += value
+                } }
+                return sum/weight
+            }
+            let centers = rasters.map(center)
+            for i in 0..<4 {
+                precondition(centers[i+1] > centers[i]+1, "4× phases do not advance: \(centers)")
+                precondition(mae(rasters[i],rasters[i+1]) > 0.1, "4× duplicated frame")
+            }
+            samples.sort()
+            print(String(format: "PASS native 4× %dx%d: three ordered distinct phases, median %.2fms p95 %.2fms; centers %@",
+                width, height, samples[samples.count/2], samples[Int(Double(samples.count-1)*0.95)], "\(centers)"))
+        }
         // Static 2px details above a fast object: restore detail without replacing
         // the interpolated object by an endpoint, including a disjoint crossing.
         func detailFrame(_ x: Int) -> CIImage {

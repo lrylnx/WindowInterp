@@ -56,7 +56,7 @@ if [ "${WI_NATIVE_ONLY:-0}" != 1 ] && [ ! -f "$APP/Contents/Resources/Native/lib
 fi
 
 if [ "$COPIED" -ne 1 ]; then
-    echo "→ 苹果原生 2× 构建，不需要 LSFG 二进制"
+    echo "→ 苹果原生 2× / 4× 构建，不需要 LSFG 二进制"
 fi
 
 # 图标（沿用播放器那份，缺就跳过）

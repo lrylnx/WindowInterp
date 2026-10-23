@@ -1,4 +1,4 @@
-// 窗口插帧助手 — ScreenCaptureKit → Apple VTLowLatencyFrameInterpolation 2× → Metal 覆盖层。
+// 窗口插帧助手 — ScreenCaptureKit → Apple VTLowLatencyFrameInterpolation 2×/4× → Metal 覆盖层。
 // 控制界面常驻，后台进程管理捕获、插帧与呈现；--backend lsfg 保留旧路径。
 // 锐化、角标与 Metal HUD 通过私有管道实时更新。
 
@@ -15,7 +15,7 @@ import Carbon.HIToolbox   // 系统级全局热键（RegisterEventHotKey）
 
 /// 版本标识 —— 「功能不好使」排查第一步永远是问版本（红线），所以把它打进
 /// 启动日志和菜单栏菜单头部，谁都能报出自己跑的是哪一版。
-let appVersion = "1.5.2"
+let appVersion = "1.5.3"
 
 // MARK: - 引擎注入（与 LSFG 视频播放器同一套路）
 
@@ -60,9 +60,9 @@ if let old = try? FileManager.default.contentsOfDirectory(at: logs,
     }
 }
 
-// Native Apple 2× is the default; --backend lsfg retains the previous diagnostic path.
+// Native Apple interpolation is the default; --backend lsfg retains the previous diagnostic path.
 let appleBackend = argument("--backend") != "lsfg"
-let supportedMultipliers = appleBackend ? [2] : [2, 3, 4, 5, 6, 8, 10, 12]
+let supportedMultipliers = appleBackend ? [2, 4] : [2, 3, 4, 5, 6, 8, 10, 12]
 let isEngineWorker = hasFlag("--engine-worker")
 let usesEngineWorker = !isEngineWorker && !hasFlag("--in-process")
 let offMode = hasFlag("--off")
@@ -853,7 +853,7 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
     @MainActor func start(filter: SCContentFilter, targetWindowID: CGWindowID, width: Int, height: Int, captureFPS: Double) async throws {
         if appleBackend && !offMode {
             guard WIAppleSupported() else { throw AppleFrameInterpolator.error("当前系统或芯片不支持苹果低延迟插帧，需要 macOS 26 或更新系统") }
-            let nativeStream = AppleInterpolationStream()
+            let nativeStream = AppleInterpolationStream(multiplier: multiplier)
             nativeStream.onOutput = { [weak self] image, deadline, generated in
                 self?.scheduleNative(image, deadline: deadline, generated: generated)
             }
@@ -1702,9 +1702,9 @@ final class FirstMouseButton: NSButton {
 
         perfModeCheck = NSButton(checkboxWithTitle: "性能模式", target: self, action: #selector(perfModeChanged(_:)))
         perfModeCheck.state = performanceMode ? .on : .off
-        perfModeCheck.toolTip = appleBackend ? "苹果原生 2× 使用独立插帧处理器，此项仅适用于 LSFG。" : "使用轻量着色器降低 GPU 开销；后台切换引擎，控制窗口保持打开。"
+        perfModeCheck.toolTip = appleBackend ? "苹果原生插帧使用独立插帧处理器，此项仅适用于 LSFG。" : "使用轻量着色器降低 GPU 开销；后台切换引擎，控制窗口保持打开。"
         perfModeCheck.isEnabled = !appleBackend
-        if appleBackend { perfModeCheck.title = "苹果原生 2×"; perfModeCheck.state = .on }
+        if appleBackend { perfModeCheck.title = "苹果原生插帧"; perfModeCheck.state = .on }
         let badgeCheck = NSButton(checkboxWithTitle: "显示右上角插帧角标", target: self, action: #selector(badgeChanged))
         badgeCheck.state = showBadge ? .on : .off
         badgeCheck.toolTip = "鼠标静止 3 秒后隐藏，在输出区域移动后恢复。"
@@ -2106,7 +2106,7 @@ final class FirstMouseButton: NSButton {
                 logLine("start: SCStream 已启动")
                 self.running = true
                 self.startButton.title = "停止插帧"
-                let modeText = offMode ? "原帧模式" : (appleBackend ? "苹果原生 2×" : "LSFG \(multiplier)×")
+                let modeText = offMode ? "原帧模式" : (appleBackend ? "苹果原生 \(multiplier)×" : "LSFG \(multiplier)×")
                 self.statusLabel.stringValue = "插帧中 · 采集 \(captureWidth)×\(captureHeight) @\(Int(fps))fps · \(modeText)"
                 self.hintLabel.stringValue = "正在插帧 · 鼠标静止 3 秒后隐藏悬浮控件"
                 logLine("start: ok target=\(target.windowID) \(target.appName) capture=\(captureWidth)x\(captureHeight) fps=\(Int(fps)) mode=\(self.mode) off=\(offMode)")
@@ -2936,7 +2936,7 @@ final class FirstMouseButton: NSButton {
     /// 引擎按「源帧率 × 倍率」出帧，超出屏幕刷新率的部分**根本显示不出来**。
     /// 60Hz 屏 + 2× 时源只要能到 30fps 就够，多采的帧等于让引擎白算一遍。
     /// 这是捕获上限；实际仍由源窗口和 WindowServer 决定。高帧率源也会被采样到该上限。
-    var effectiveCaptureFPS: Double { appleBackend && !offMode ? max(1, min(60, Double(targetFPS) / 2)) : 60 }
+    var effectiveCaptureFPS: Double { appleBackend && !offMode ? max(1, min(60, Double(targetFPS) / Double(multiplier))) : 60 }
 
     /// 端到端延迟估计（毫秒）—— 不是拍脑袋，是 `dev/lat-round.sh`（扫描条相对位置法）
     /// 实测出来的。两套实测（Apple M4 / 光流 0.5 / queueDepth 3 / 工作分辨率 400p）：
@@ -3153,7 +3153,7 @@ final class FirstMouseButton: NSButton {
             engineOutFPS = p.displayFPS
             engineSrcFPS = stats.inputFPS
             lastEngineStamp = CACurrentMediaTime()
-            parts.append(String(format: "苹果 2× · 已显示中间帧 %d · 处理 %.1fms · 工作 %d×%d",
+            parts.append(String(format: "苹果 \(multiplier)× · 已显示中间帧 %d · 处理 %.1fms · 工作 %d×%d",
                                 lastEngineGenerated, stats.processingMS, Int(stats.size.width), Int(stats.size.height)))
         }
         if !appleBackend, !offMode, let text = tailOfFile(engineLog) {
@@ -3220,7 +3220,7 @@ final class FirstMouseButton: NSButton {
                 ? (offMode ? "原帧 · \(Int(pipeline?.feedFPS ?? 0))fps"
                            : (paused ? "⏸ 已暂停（⌃⌥P 继续）"
                                      : (engineOutFPS > 1 && CACurrentMediaTime() - lastEngineStamp < 4
-                                        ? (appleBackend ? String(format: "苹果 2× · 呈现 %.0f fps", engineOutFPS) : String(format: "%@ · 源 %.0f → 估计输出 %.0f fps", multiplierLabel, engineSrcFPS, engineOutFPS))
+                                        ? (appleBackend ? String(format: "苹果 \(multiplier)× · 呈现 %.0f fps", engineOutFPS) : String(format: "%@ · 源 %.0f → 估计输出 %.0f fps", multiplierLabel, engineSrcFPS, engineOutFPS))
                                         : "\(multiplierLabel) · 采集 \(Int(pipeline?.feedFPS ?? 0))fps · 等待引擎统计")))
                 : "已停止"
         }
