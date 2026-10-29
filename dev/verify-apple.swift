@@ -55,6 +55,7 @@ import QuartzCore
         zip(a,b).enumerated().reduce(0.0) { $0 + ($1.offset % 4 == 3 ? 0 : abs(Double($1.element.0) - Double($1.element.1))) } / Double(a.count / 4 * 3)
     }
     static func main() throws {
+        setbuf(stdout, nil)
         precondition(WIAppleSupported(), "Apple low-latency interpolation unavailable")
         for (width, height) in [(640, 360), (1280, 720), (1920, 1080), (1280, 800), (2560, 1066)] {
             let engine = try AppleFrameInterpolator(width: width, height: height)
@@ -132,6 +133,120 @@ import QuartzCore
             print(String(format: "PASS native 4× %dx%d: three ordered distinct phases, median %.2fms p95 %.2fms; centers %@",
                 width, height, samples[samples.count/2], samples[Int(Double(samples.count-1)*0.95)], "\(centers)"))
         }
+        // Slowly changing shadows must use the matching temporal reference,
+        // rather than borrowing the future endpoint for all three phases.
+        do {
+            let w=640, h=360
+            let engine = try AppleFrameInterpolator(width:w,height:h,multiplier:4)
+            let a = source(width:w,height:h,x:0)
+            CVPixelBufferLockBaseAddress(a, [])
+            let p = CVPixelBufferGetBaseAddress(a)!.assumingMemoryBound(to:UInt8.self)
+            let stride = CVPixelBufferGetBytesPerRow(a)
+            for y in 0..<h { for x in 0..<w {
+                for c in 0..<3 { p[y*stride+x*4+c] = UInt8(8+x*100/w) }
+                p[y*stride+x*4+3] = 255
+            } }
+            CVPixelBufferUnlockBaseAddress(a, [])
+            let b = try engine.copyOriginal(a)
+            CVPixelBufferLockBaseAddress(b, [])
+            let q = CVPixelBufferGetBaseAddress(b)!.assumingMemoryBound(to:UInt8.self)
+            let bs = CVPixelBufferGetBytesPerRow(b)
+            for y in 0..<h { for x in 0..<w { for c in 0..<3 { q[y*bs+x*4+c] += 4 } } }
+            CVPixelBufferUnlockBaseAddress(b, [])
+            let aa = try engine.convert(a), bb = try engine.convert(b)
+            let frames = try engine.intermediates(previous:aa,previousPTS:.zero,current:bb,currentPTS:CMTime(value:1,timescale:30))
+            let original = bytes(a,width:w,height:h)
+            var levels:[Double] = []
+            for (i, frame) in frames.enumerated() {
+                let image = try StaticDetailPreserver().preserve(previous:CIImage(cvPixelBuffer:a), current:CIImage(cvPixelBuffer:b),
+                    middle:AppleFrameInterpolator.displayImage(frame,canvas:CGSize(width:w,height:h)),phase:Double(i+1)/4)
+                let pixels = raster(image,width:w,height:h)
+                var level=0.0
+                for y in 10..<h-10 { for x in 10..<w-10 {
+                    let j=(y*w+x)*4; level += Double(pixels[j])-Double(original[j])
+                } }
+                level /= Double((w-20)*(h-20)); levels.append(level)
+                precondition(abs(level-Double(i+1)) < 0.5, "shadow jumps toward future endpoint: \(levels)")
+            }
+            print("PASS shadow fade: expected [1, 2, 3] code values; actual \(levels)")
+        }
+        // Infer visible cadence, including capture quantization and held frames.
+        for fps in [24,25,30] {
+            for captureFPS in [48.0,60.0] {
+                var detector=AutomaticVideoCadence(), previous = -1
+                for i in 0..<Int(captureFPS*7) {
+                    let t=Double(i)/captureFPS
+                    let frame=Int(floor(t*Double(fps)+0.00001))
+                    detector.observe(changed:Array(repeating:frame != previous,count:6),at:t)
+                    previous=frame
+                }
+                print("auto diagnostic \(fps)fps at \(captureFPS): \(detector.fps) confidence \(detector.confidence)")
+                precondition(detector.fps == fps, "automatic cadence did not identify source")
+                let locked=detector.fps
+                for i in 0..<Int(captureFPS*4) { detector.observe(changed:Array(repeating:false,count:6),at:7+Double(i)/captureFPS) }
+                precondition(detector.fps == locked, "still image erased known cadence")
+            }
+        }
+        do {
+            var detector=AutomaticVideoCadence(), old = -1
+            for i in 0..<720 {
+                let t=Double(i)/48, fps=t<7 ? 25.0:30.0
+                let frame=Int(floor(t*fps+0.00001))
+                detector.observe(changed:Array(repeating:frame != old,count:6),at:t);old=frame
+            }
+            precondition(detector.fps == 30, "did not adapt from 25 to 30fps")
+            var ui=AutomaticVideoCadence()
+            for i in 0..<480 { ui.observe(changed:[true,false,false,false,false,false],at:Double(i)/48) }
+            precondition(ui.fps == 0, "one animated control selected video cadence")
+            var fast=AutomaticVideoCadence()
+            for i in 0..<480 { fast.observe(changed:Array(repeating:true,count:6),at:Double(i)/48) }
+            precondition(fast.fps == 0, "unsupported high-rate UI was labeled 24/25/30fps")
+            print("PASS automatic cadence: 24/25/30, 48/60Hz capture, still hold, 25→30 change, UI rejection")
+        }
+        // A pixel outside the sparse probe grid must still prevent a false duplicate.
+        do {
+            let a=source(width:640,height:360,x:100), b=source(width:640,height:360,x:100)
+            precondition(VideoFrameIdentity.equal(a,b))
+            CVPixelBufferLockBaseAddress(b,[])
+            let p=CVPixelBufferGetBaseAddress(b)!.assumingMemoryBound(to:UInt8.self)
+            p[7*CVPixelBufferGetBytesPerRow(b)+13*4] ^= 1
+            CVPixelBufferUnlockBaseAddress(b,[])
+            precondition(!VideoFrameIdentity.equal(a,b), "sparse sampling hid a changed pixel")
+            var clock=VideoCadenceClock(fps:25)
+            var times:[Double]=[], prior = -1
+            for i in 0..<480 {
+                let frame=Int(floor(Double(i)*25/48))
+                if frame == prior { continue }; prior=frame
+                let tick=clock.advance(100+Double(i)/48)
+                precondition(tick.gap == 1, "25fps at 48 captures misclassified: \(tick)")
+                times.append(tick.time)
+            }
+            for (a,b) in zip(times,times.dropFirst()) { precondition(abs(b-a-0.04)<0.000001) }
+            // Declared video cadence must not run ahead when UI changes too fast.
+            var fast=VideoCadenceClock(fps:25)
+            for i in 0..<480 {
+                let t=Double(i)/48
+                let tick=fast.advance(t)
+                precondition(tick.time-t <= 0.031)
+            }
+            print("PASS video identity: complete pixel comparison; 25fps/48Hz captures reconstruct uniform 40ms steps; fast UI bounded")
+        }
+        for (w,h) in [(1200,500),(1920,800)] {
+            let e=try AppleFrameInterpolator(width:w,height:h,multiplier:4,videoQuality:true)
+            let a=try e.convert(source(width:w,height:h,x:w/4)), b=try e.convert(source(width:w,height:h,x:w/4+w/40))
+            var samples:[Double]=[]
+            for i in 0..<12 {
+                let t=CACurrentMediaTime()
+                let frames=try e.intermediates(previous:a,previousPTS:CMTime(value:Int64(i),timescale:25),current:b,currentPTS:CMTime(value:Int64(i+1),timescale:25))
+                precondition(frames.count == 3)
+                if i>2 { samples.append((CACurrentMediaTime()-t)*1000) }
+            }
+            if ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27 {
+                precondition(e.size == CGSize(width:w,height:h), "video quality unexpectedly downscaled")
+            }
+            samples.sort()
+            print("PASS video native \(w)x\(h) -> \(e.size), cascade 4× median \(samples[samples.count/2])ms")
+        }
         // Static 2px details above a fast object: restore detail without replacing
         // the interpolated object by an endpoint, including a disjoint crossing.
         func detailFrame(_ x: Int) -> CIImage {
@@ -172,6 +287,32 @@ import QuartzCore
                      "averaging hid fine motion and copied endpoint detail")
         print(String(format:"PASS static detail: error %.2f -> %.2f; fast crossing retained",rawError/4608,fixedError/4608))
 
+        do {
+            let stream=AppleInterpolationStream(multiplier:4,videoFPS:25)
+            let mutex=NSLock(); var due:[Double]=[]; var errors:[String]=[]
+            stream.onOutput = { _,time,generated in if generated { mutex.lock(); due.append(time); mutex.unlock() } }
+            stream.onError = { message in mutex.lock(); errors.append(message); mutex.unlock() }
+            let frames=(0..<80).map { source(width:640,height:360,x:20+$0*3) }
+            let start=CACurrentMediaTime()
+            for i in 0..<144 {
+                let capture=CACurrentMediaTime()
+                stream.submit(frames[Int((capture-start)*25)%frames.count],pts:CMTime(seconds:capture,preferredTimescale:60000))
+                Thread.sleep(forTimeInterval:max(0,start+Double(i+1)/48-CACurrentMediaTime()))
+            }
+            Thread.sleep(forTimeInterval:0.18)
+            let stats=stream.cadenceStats
+            stream.stop(); Thread.sleep(forTimeInterval:0.1)
+            mutex.lock(); let count=due.count, failures=errors; let stamps=due; mutex.unlock()
+            print("video stream diagnostic count=\(count) stats=\(stats) errors=\(failures)")
+            precondition(failures.isEmpty, "video stream failed: \(failures)")
+            precondition(count>120 && stats.duplicates>30, "video stream did not interpolate and deduplicate: \(count) \(stats)")
+            var correct=0
+            for (a,b) in zip(stamps,stamps.dropFirst()) { if abs(b-a-0.01)<0.00002 { correct += 1 } }
+            // Across original boundaries generated-to-generated is 20ms.
+            print("video stream cadence matching=\(correct) / \(count)")
+            precondition(correct>count/2, "video stream did not schedule 10ms phases")
+            print("PASS video stream: \(count) intermediates, duplicates \(stats.duplicates), 10ms cadence, errors=0")
+        }
         // Timestamp discontinuity, size change and stop exercise the production stream.
         let stream = AppleInterpolationStream()
         let outputLock = NSLock()

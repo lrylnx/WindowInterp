@@ -15,7 +15,11 @@ ROOT = Path(__file__).resolve().parent.parent
 APP = Path(os.environ.get('WI_APP_PATH', str(ROOT / '窗口插帧助手.app')))
 MULTIPLIER = int(os.environ.get('WI_TEST_MULTIPLIER', '2'))
 TARGET_FPS = int(os.environ.get('WI_TEST_TARGET_FPS', '60'))
-OUT = ROOT / f'dev/native-verification/live-{MULTIPLIER}x-{TARGET_FPS}'
+CAPTURE_LIMIT = int(os.environ.get('WI_TEST_CAPTURE_FPS', '0'))
+VIDEO_FPS = int(os.environ.get('WI_TEST_VIDEO_FPS', '0'))
+SOURCE_FPS = int(os.environ.get('WI_TEST_SOURCE_FPS', str(max(0,VIDEO_FPS))))
+EXPECTED_FPS = min(TARGET_FPS, (SOURCE_FPS or CAPTURE_LIMIT or 60) * MULTIPLIER)
+OUT = ROOT / f'dev/native-verification/live-{MULTIPLIER}x-{TARGET_FPS}-cap{CAPTURE_LIMIT}-video{VIDEO_FPS}'
 OUT.mkdir(parents=True, exist_ok=True)
 
 def alive(pid):
@@ -38,7 +42,7 @@ def run():
     try:
         with (OUT/'source.log').open('w') as stream:
             source = subprocess.Popen([str(ROOT/'dev/testpattern'), '--width', os.environ.get('WI_TEST_WIDTH', '640'), '--height', os.environ.get('WI_TEST_HEIGHT', '400'),
-                                       '--x', '40', '--y', '60'], stdout=stream, stderr=stream)
+                                       '--x', '40', '--y', '60', '--stepped-fps', str(SOURCE_FPS), '--media-file', os.environ.get('WI_TEST_MEDIA_FILE', ''), '--browser-noise' if os.environ.get('WI_TEST_BROWSER_NOISE') else '--no-browser-noise'], stdout=stream, stderr=stream)
         time.sleep(1)
         match = re.search(r'windowNumber=(\d+)', (OUT/'source.log').read_text())
         assert match, 'test source failed to create a window'
@@ -54,7 +58,7 @@ def run():
                                 '--stderr', str(output), str(APP), '--args',
                                 '--window-id', match[1], '--autostart', '--test-window',
                                 '--test-x', '740', '--test-y', '60', '--test-w', '640', '--test-h', '400',
-                                '--multiplier', str(MULTIPLIER), '--target-fps', str(TARGET_FPS), '--backend', 'apple', '--quality', '--control-stdin'],
+                                '--multiplier', str(MULTIPLIER), '--target-fps', str(TARGET_FPS), '--capture-fps', str(CAPTURE_LIMIT), '--video-fps', str(VIDEO_FPS), '--backend', 'apple', '--quality', '--control-stdin'],
                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         def read():
             nonlocal controller
@@ -97,12 +101,28 @@ def run():
             return e['worker']
         worker = applied(MULTIPLIER, False)
         measured = wait(lambda e: e.get('event') == 'stats' and e.get('backend') == 'apple'
-                        and e.get('generated', 0) > 60 and e['outputFPS'] > TARGET_FPS * 0.85, timeout=40)
-        assert measured['sourceFPS'] > min(60, TARGET_FPS/MULTIPLIER) * 0.85, measured
+                        and e.get('generated', 0) > 60 and e['outputFPS'] > EXPECTED_FPS * 0.85, timeout=40)
+        assert measured['sourceFPS'] > EXPECTED_FPS/MULTIPLIER * 0.85, measured
         stable = [wait(lambda e: e.get('event') == 'stats' and e.get('generated', 0) > measured['generated']) for _ in range(8)]
         rates = sorted(e['outputFPS'] for e in stable)
-        assert rates[len(rates)//2] > TARGET_FPS * 0.90, stable
+        assert rates[len(rates)//2] > EXPECTED_FPS * 0.90, stable
         assert stable[-1]['presentationStalls'] - stable[0]['presentationStalls'] < max(20, TARGET_FPS // 2), stable
+        if VIDEO_FPS:
+            assert all(e["videoFPS"] == VIDEO_FPS for e in stable)
+            if os.environ.get('WI_TEST_MEDIA_FILE'):
+                # Film/animation can intentionally hold identical pictures.
+                # Correctly skipping them lowers useful-frame and presentation rates.
+                assert all(0 <= e["uniqueFPS"] <= SOURCE_FPS+3 for e in stable), stable
+                assert stable[-1]["duplicates"] > 0, stable
+            else:
+                assert all(abs(e["uniqueFPS"]-SOURCE_FPS) < 3 for e in stable), stable
+            assert max(rates) <= EXPECTED_FPS+3, stable
+            if VIDEO_FPS == -1:
+                assert all(e["detectedVideoFPS"] == SOURCE_FPS for e in stable), stable
+                print("PASS automatic video cadence:", SOURCE_FPS, "fps", flush=True)
+        if CAPTURE_LIMIT and not VIDEO_FPS:
+            assert all(e['captureFPSLimit'] == CAPTURE_LIMIT for e in stable)
+            assert max(rates) <= EXPECTED_FPS + 2, stable
         (OUT/'cadence.json').write_text(json.dumps(stable, ensure_ascii=False, indent=2))
         print('PASS actual drawable cadence: median', rates[len(rates)//2], 'fps; stalls delta',
               stable[-1]['presentationStalls'] - stable[0]['presentationStalls'], flush=True)
@@ -135,6 +155,9 @@ def run():
         send('pause', value=False)
         wait(lambda e: e.get('event') == 'stats' and not e['paused'] and e.get('generated', 0) > 30)
         print('PASS rapid resume/pause honors final requested state', flush=True)
+        if VIDEO_FPS:
+            send('video-fps', value=0)
+            wait(lambda e: e.get('event') == 'applied' and e.get('videoFPS') == 0)
         send('mode', value=1)
         display = wait(lambda e: e.get('event') == 'applied' and e['mode'] == 1)
         worker = display['worker']
@@ -143,6 +166,11 @@ def run():
         worker = applied(MULTIPLIER, False)
         wait(lambda e: e.get('event') == 'stats' and e.get('generated', 0) > 30)
         print('PASS display/window capture switch', flush=True)
+        if VIDEO_FPS:
+            send('video-fps', value=VIDEO_FPS)
+            wait(lambda e: e.get('event') == 'applied' and e.get('videoFPS') == VIDEO_FPS)
+            wait(lambda e: e.get('event') == 'stats' and e.get('generated',0)>60)
+            print('PASS generic/video profile switching', flush=True)
         if MULTIPLIER == 4:
             send('multiplier', value=2)
             worker = applied(2, False)
@@ -151,6 +179,14 @@ def run():
             worker = applied(4, False)
             wait(lambda e: e.get('event') == 'stats' and e.get('generated', 0) > 60)
             print('PASS native 4× → 2× → 4× switching', flush=True)
+        if CAPTURE_LIMIT and not VIDEO_FPS:
+            send('capture-fps', value=0)
+            wait(lambda e: e.get('event') == 'applied' and e.get('captureFPSLimit') == 0)
+            wait(lambda e: e.get('event') == 'stats' and e.get('generated', 0) > 60)
+            send('capture-fps', value=CAPTURE_LIMIT)
+            wait(lambda e: e.get('event') == 'applied' and e.get('captureFPSLimit') == CAPTURE_LIMIT)
+            wait(lambda e: e.get('event') == 'stats' and e.get('generated', 0) > 60)
+            print('PASS capture limit switching without controller restart', flush=True)
         send('stop')
         deadline = time.monotonic()+6
         while time.monotonic() < deadline and any(alive(p) for p in workers): time.sleep(0.1)

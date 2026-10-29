@@ -17,6 +17,7 @@
 
 import Cocoa
 import CoreText
+import AVFoundation
 
 let argv = CommandLine.arguments
 func arg(_ key: String) -> String? {
@@ -38,7 +39,13 @@ let rulerMode = hasFlag("--ruler")
 // 用途：负向验证「源窗口没有帧率」这条路径 —— ScreenCaptureKit 只在内容变化时送帧，
 // 所以静止窗口几乎不产生源帧，自动倍率应当判定「量不出源帧率」而保持 2×，
 // 而不是硬猜一个倍率。没有这个开关就没法稳定复现该场景（真实静态窗口不好控制）。
+let mediaPlayer: AVPlayer? = {
+    guard let file = arg("--media-file"), !file.isEmpty else { return nil }
+    let player=AVPlayer(url:URL(fileURLWithPath:file)); player.isMuted=true
+    return player
+}()
 let staticMode = hasFlag("--static")
+let steppedFPS = Double(arg("--stepped-fps") ?? "") ?? 0
 // --soft：模拟「源 App 只按低分辨率渲染、被系统双线性放大到窗口尺寸」那种**糊**
 // —— 正是「档 1」（输出重建）要治的东西。
 //
@@ -123,7 +130,13 @@ if rulerMode {
     scan.add(scanX, forKey: "scanX")
 }
 
-if staticMode {
+if let player=mediaPlayer {
+    let layer=AVPlayerLayer(player:player)
+    layer.frame=root.bounds; layer.videoGravity = .resizeAspect
+    host.addSublayer(layer)
+    let start=Double(arg("--media-start") ?? "") ?? 300
+    player.seek(to:CMTime(seconds:start,preferredTimescale:600),toleranceBefore:.zero,toleranceAfter:.zero) { _ in player.play() }
+} else if staticMode {
     // 静态背景 + 一个固定色块：整幅画面**永远不变**。
     // 不挂任何 CAAnimation ⇒ WindowServer 不会持续重绘 ⇒ SCK 不会送新帧。
     let bg = CAGradientLayer()
@@ -138,6 +151,22 @@ if staticMode {
     box.backgroundColor = NSColor.systemGray.cgColor
     box.cornerRadius = 16
     host.addSublayer(box)
+} else if steppedFPS > 0 {
+    let background = CAGradientLayer()
+    background.frame = root.bounds
+    background.colors = [NSColor.darkGray.cgColor, NSColor.black.cgColor]
+    host.addSublayer(background)
+    let block = CALayer()
+    block.frame = CGRect(x:0,y:wantH*0.3,width:wantW*0.12,height:wantH*0.4)
+    block.backgroundColor = NSColor.systemOrange.cgColor
+    host.addSublayer(block)
+    var frame = 0
+    Timer.scheduledTimer(withTimeInterval:1/steppedFPS,repeats:true) { _ in
+        frame += 1
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        block.position.x = (Double(frame)*wantW/(steppedFPS*3)).truncatingRemainder(dividingBy:wantW)
+        CATransaction.commit()
+    }
 } else if softMode {
     // —— 低分辨率源（被线性放大 2×）——
     let dw = max(16, Int(wantW / 2)), dh = max(16, Int(wantH / 2))
@@ -267,6 +296,18 @@ beat.add(pulse, forKey: "pulse")
 }   // end of !rulerMode
 
 win.orderFrontRegardless()
+// Continuously changing corner UI, outside the interior video sampling tiles.
+if hasFlag("--browser-noise") {
+    let indicator=CALayer()
+    indicator.frame=CGRect(x:wantW-20,y:wantH-20,width:12,height:12)
+    indicator.backgroundColor=NSColor.systemTeal.cgColor
+    host.addSublayer(indicator)
+    let blink=CABasicAnimation(keyPath:"opacity")
+    blink.fromValue=0.1;blink.toValue=1.0;blink.duration=0.3
+    blink.autoreverses=true;blink.repeatCount = .infinity
+    indicator.add(blink,forKey:"browser-noise")
+}
+
 if nativeFS {
     // 走一次真正的原生全屏：macOS 会给它建独立 Space（正是我们要复现的场景）
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {

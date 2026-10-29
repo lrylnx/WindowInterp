@@ -15,7 +15,7 @@ import Carbon.HIToolbox   // 系统级全局热键（RegisterEventHotKey）
 
 /// 版本标识 —— 「功能不好使」排查第一步永远是问版本（红线），所以把它打进
 /// 启动日志和菜单栏菜单头部，谁都能报出自己跑的是哪一版。
-let appVersion = "1.5.3"
+let appVersion = "1.6.1"
 
 // MARK: - 引擎注入（与 LSFG 视频播放器同一套路）
 
@@ -100,6 +100,21 @@ let targetFPS: Int = {
     if saved > 0 { return saved }
     let hz = CGDisplayCopyDisplayMode(CGMainDisplayID())?.refreshRate ?? 0
     return Int(hz > 1 ? hz.rounded() : 60)
+}()
+
+// Window capture updates are not decoded video frames. Let video users cap
+// capture explicitly instead of implying that 36 window updates mean 36fps video.
+let captureFPSChoices = [0, 24, 25, 30, 50, 60]
+var captureFPSLimit: Int = {
+    let value = Int(argument("--capture-fps") ?? "") ?? preferences.integer(forKey: "captureFPSLimit")
+    return captureFPSChoices.contains(value) ? value : 0
+}()
+
+let videoFPSChoices = [-1, 0, 24, 25, 30]
+var videoFrameRate: Int = {
+    let saved = preferences.object(forKey: "videoFrameRate") == nil ? -1 : preferences.integer(forKey: "videoFrameRate")
+    let value = Int(argument("--video-fps") ?? "") ?? saved
+    return videoFPSChoices.contains(value) ? value : -1
 }()
 
 // 注入只发生在引擎进程；控制窗口不会随引擎参数变化而重启。
@@ -760,6 +775,7 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
     private var slowPresentations = 0
     var displayFPS: Double { lock.withLock { CACurrentMediaTime() - lastPresentedTime < 2 ? displayedFPS : 0 } }
     var presentationStalls: Int { lock.withLock { slowPresentations } }
+    var appleCadenceStats: (uniqueFPS: Double, duplicates: Int, resets: Int, detectedFPS: Double)? { appleStream?.cadenceStats }
     var appleStats: (generated: Int, replaced: Int, processingMS: Double, size: CGSize, inputFPS: Double)? { appleStream?.stats }
     var presentedGeneratedCount: Int { lock.withLock { nativePresentedGenerated } }
     private var latest: CIImage?
@@ -853,7 +869,7 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
     @MainActor func start(filter: SCContentFilter, targetWindowID: CGWindowID, width: Int, height: Int, captureFPS: Double) async throws {
         if appleBackend && !offMode {
             guard WIAppleSupported() else { throw AppleFrameInterpolator.error("当前系统或芯片不支持苹果低延迟插帧，需要 macOS 26 或更新系统") }
-            let nativeStream = AppleInterpolationStream(multiplier: multiplier)
+            let nativeStream = AppleInterpolationStream(multiplier: multiplier, videoFPS: Double(videoFrameRate))
             nativeStream.onOutput = { [weak self] image, deadline, generated in
                 self?.scheduleNative(image, deadline: deadline, generated: generated)
             }
@@ -976,13 +992,14 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
     // Bound retained IOSurfaces and reject stale output instead of accumulating delay.
     private func scheduleNative(_ image: CIImage, deadline: Double, generated: Bool) {
         lock.lock()
-        guard !stopped, nativeScheduled < 16 else {
+        guard !stopped, nativeScheduled < (videoFrameRate != 0 ? 32 : 16) else {
             replacedFrames += 1; lock.unlock(); return
         }
         nativeScheduled += 1
         let epoch = nativeEpoch
         lock.unlock()
-        renderQueue.asyncAfter(deadline: .now() + max(0, deadline - CACurrentMediaTime() - 0.004)) { [weak self] in
+        let preparationLead = videoFrameRate != 0 ? 0.012 : 0.004
+        renderQueue.asyncAfter(deadline: .now() + max(0, deadline - CACurrentMediaTime() - preparationLead)) { [weak self] in
             guard let self else { return }
             self.lock.lock()
             self.nativeScheduled -= 1
@@ -1187,12 +1204,24 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
         lock.unlock()
     }
 
+    private lazy var nativeDisplayHz: Double = {
+        let hz=CGDisplayCopyDisplayMode(CGMainDisplayID())?.refreshRate ?? 0
+        return hz>1 ? hz : Double(targetFPS)
+    }()
+    private var nativeLongFrameThreshold: Double {
+        let detected=videoFrameRate == -1 ? (appleStream?.cadenceStats.detectedFPS ?? 0) : Double(videoFrameRate)
+        if videoFrameRate == -1 && detected<=0 { return .infinity }
+        let source=detected>0 ? detected : Double(captureFPSLimit>0 ? captureFPSLimit : 60)
+        let expected=min(Double(targetFPS),source*Double(multiplier))
+        return 1.5*ceil(nativeDisplayHz/max(1,expected))/nativeDisplayHz
+    }
+
     private func recordNativePresentation(_ time: Double, generated: Bool) {
         guard time > 0 else { return }
         lock.lock(); defer { lock.unlock() }
         guard !stopped else { return }
         if generated { nativePresentedGenerated += 1 }
-        if lastPresentedTime > 0, time - lastPresentedTime > 1.5 / Double(targetFPS) { slowPresentations += 1 }
+        if lastPresentedTime > 0, time - lastPresentedTime > nativeLongFrameThreshold { slowPresentations += 1 }
         lastPresentedTime = time
         if displayWindowStart == 0 { displayWindowStart = time }
         displayedFrames += 1
@@ -1329,6 +1358,8 @@ final class FirstMouseButton: NSButton {
     private var pauseTestScheduled = false
     var startButton = NSButton(title: "开始插帧", target: nil, action: nil)
     var multiplierPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    var videoProfilePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    var captureFPSPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     var modePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     /// 「性能模式（轻量着色器）」复选框。菜单栏也要能改它，所以留成属性好同步状态。
     var perfModeCheck = NSButton(checkboxWithTitle: "", target: nil, action: nil)
@@ -1431,6 +1462,11 @@ final class FirstMouseButton: NSButton {
     var remoteFrames = 0
     var remoteDropped = 0
     var remoteFPS: Double = 0
+    var appliedVideoFrameRate = videoFrameRate
+    var remoteDetectedVideoFPS = 0.0
+    var remoteUniqueFPS = 0.0
+    var remoteDuplicates = 0
+    var appliedCaptureFPSLimit = captureFPSLimit
     var appliedMultiplier = multiplier
     var appliedPerformance = performanceMode
     var appliedMode: CaptureMode = .window
@@ -1694,7 +1730,24 @@ final class FirstMouseButton: NSButton {
         let modeColumn = vertical([label("抓取方式", size: 11, weight: .medium, color: .secondaryLabelColor), modePopup])
         multiplierPopup.widthAnchor.constraint(equalTo: multiplierColumn.widthAnchor).isActive = true
         modePopup.widthAnchor.constraint(equalTo: modeColumn.widthAnchor).isActive = true
-        let options = NSStackView(views: [multiplierColumn, modeColumn])
+        captureFPSPopup.addItems(withTitles: captureFPSChoices.map { $0 == 0 ? "自动（按屏幕）" : "\($0) fps" })
+        captureFPSPopup.item(at: 0)?.title = videoFrameRate != 0 ? "60 fps" : "自动（按屏幕）"
+        captureFPSPopup.selectItem(at: videoFrameRate != 0 ? 0 : (captureFPSChoices.firstIndex(of: captureFPSLimit) ?? 0))
+        captureFPSPopup.target = self
+        captureFPSPopup.action = #selector(captureFPSChanged)
+        captureFPSPopup.controlSize = .large
+        captureFPSPopup.isEnabled = appleBackend && videoFrameRate == 0
+        captureFPSPopup.toolTip = "窗口采集上限，不是视频解码帧率检测。30fps 视频可选 30fps，4× 约输出 120fps；实际会受捕获时序影响。"
+        let captureColumn = vertical([label("采集上限", size: 11, weight: .medium, color: .secondaryLabelColor), captureFPSPopup])
+        captureFPSPopup.widthAnchor.constraint(equalTo: captureColumn.widthAnchor).isActive = true
+        videoProfilePopup.addItems(withTitles: videoFPSChoices.map { $0 == -1 ? "自动视频" : ($0 == 0 ? "通用窗口" : "视频 \($0)fps") })
+        videoProfilePopup.selectItem(at: videoFPSChoices.firstIndex(of: videoFrameRate) ?? 0)
+        videoProfilePopup.target = self; videoProfilePopup.action = #selector(videoProfileChanged)
+        videoProfilePopup.controlSize = .large; videoProfilePopup.isEnabled = appleBackend
+        videoProfilePopup.toolTip = "自动视频通过画面变化估算24/25/30fps，稳定后恢复节奏；静止时保留已识别结果，无法确认时显示原帧。可手动覆盖。高质量插帧增加约140ms缓冲，窗口动画可能影响判断。"
+        let videoColumn = vertical([label("内容节奏", size: 11, weight: .medium, color: .secondaryLabelColor), videoProfilePopup])
+        videoProfilePopup.widthAnchor.constraint(equalTo: videoColumn.widthAnchor).isActive = true
+        let options = NSStackView(views: [multiplierColumn, modeColumn, captureColumn, videoColumn])
         options.distribution = .fillEqually
         options.spacing = 20
         let optionsCard = card(options)
@@ -1847,6 +1900,36 @@ final class FirstMouseButton: NSButton {
         }
     }
     @objc func badgeChanged(_ sender: NSButton) { showBadge.toggle(); preferences.set(showBadge, forKey: "showBadge"); badge?.isHidden = !showBadge || !floatingControlsVisible; if showBadge { flashHUD() }; sendLiveSettings() }
+
+    @objc func videoProfileChanged() {
+        let index = videoProfilePopup.indexOfSelectedItem
+        guard videoFPSChoices.indices.contains(index) else { return }
+        applyVideoFrameRate(videoFPSChoices[index])
+    }
+
+    func applyVideoFrameRate(_ value: Int) {
+        guard appleBackend, videoFPSChoices.contains(value), value != videoFrameRate else { return }
+        videoFrameRate = value; preferences.set(value, forKey: "videoFrameRate")
+        videoProfilePopup.selectItem(at: videoFPSChoices.firstIndex(of: value) ?? 0)
+        captureFPSPopup.isEnabled = value == 0
+        captureFPSPopup.item(at: 0)?.title = value != 0 ? "60 fps" : "自动（按屏幕）"
+        captureFPSPopup.selectItem(at: value != 0 ? 0 : (captureFPSChoices.firstIndex(of: captureFPSLimit) ?? 0))
+        scheduleEngineSwitch()
+    }
+
+    @objc func captureFPSChanged() {
+        let index = captureFPSPopup.indexOfSelectedItem
+        guard captureFPSChoices.indices.contains(index) else { return }
+        applyCaptureFPSLimit(captureFPSChoices[index])
+    }
+
+    func applyCaptureFPSLimit(_ value: Int) {
+        guard appleBackend, captureFPSChoices.contains(value), value != captureFPSLimit else { return }
+        captureFPSLimit = value
+        preferences.set(value, forKey: "captureFPSLimit")
+        captureFPSPopup.selectItem(at: captureFPSChoices.firstIndex(of: value) ?? 0)
+        scheduleEngineSwitch()
+    }
 
     @objc func multiplierChanged() {
         let index = multiplierPopup.indexOfSelectedItem
@@ -2936,7 +3019,11 @@ final class FirstMouseButton: NSButton {
     /// 引擎按「源帧率 × 倍率」出帧，超出屏幕刷新率的部分**根本显示不出来**。
     /// 60Hz 屏 + 2× 时源只要能到 30fps 就够，多采的帧等于让引擎白算一遍。
     /// 这是捕获上限；实际仍由源窗口和 WindowServer 决定。高帧率源也会被采样到该上限。
-    var effectiveCaptureFPS: Double { appleBackend && !offMode ? max(1, min(60, Double(targetFPS) / Double(multiplier))) : 60 }
+    var effectiveCaptureFPS: Double {
+        guard appleBackend && !offMode else { return 60 }
+        if videoFrameRate != 0 { return 60 }
+        return max(1, min(captureFPSLimit > 0 ? Double(captureFPSLimit) : 60, Double(targetFPS) / Double(multiplier)))
+    }
 
     /// 端到端延迟估计（毫秒）—— 不是拍脑袋，是 `dev/lat-round.sh`（扫描条相对位置法）
     /// 实测出来的。两套实测（Apple M4 / 光流 0.5 / queueDepth 3 / 工作分辨率 400p）：
@@ -3133,7 +3220,14 @@ final class FirstMouseButton: NSButton {
     func tickStatus() {
         if usesEngineWorker {
             if running && pendingSession == nil {
-                statusLabel.stringValue = paused ? "⏸ 已暂停" : String(format: "%d× · 呈现 %.1f fps · 已渲染 %d · 丢弃过期帧 %d", appliedMultiplier, remoteFPS, remoteFrames, remoteDropped)
+                statusLabel.stringValue = paused ? "⏸ 已暂停" : String(format: "%d× · 窗口采集 %.1f → 呈现 %.1f fps · 丢弃 %d", appliedMultiplier, engineSrcFPS, remoteFPS, remoteDropped)
+                if appleBackend && appliedVideoFrameRate != 0 && !paused {
+                    if appliedVideoFrameRate == -1 {
+                        statusLabel.stringValue = remoteDetectedVideoFPS > 0
+                            ? String(format:"自动约%.0ffps · 变化 %.1f → 呈现 %.1f fps · 去重 %d",remoteDetectedVideoFPS,remoteUniqueFPS,remoteFPS,remoteDuplicates)
+                            : "自动视频 · 正在识别节奏，暂时显示原帧"
+                    } else { statusLabel.stringValue = String(format: "视频%d · 变化 %.1f → 呈现 %.1f fps · 跳过重复 %d", appliedVideoFrameRate, remoteUniqueFPS, remoteFPS, remoteDuplicates) }
+                }
                 if engineOutFPS > 0 && !appleBackend { statusLabel.stringValue += String(format: " · 估计输出 %.0f fps", engineOutFPS) }
                 if !settingsError.isEmpty { statusLabel.stringValue += " · ⚠️ 设置未应用：" + settingsError }
             }
@@ -3235,7 +3329,11 @@ final class FirstMouseButton: NSButton {
             emitWorkerEvent(["event": "stats", "frames": pipeline?.frameCount ?? 0,
                              "dropped": pipeline?.droppedCount ?? 0, "fps": (appleBackend && !offMode ? pipeline?.displayFPS : pipeline?.feedFPS) ?? 0,
                              "outputFPS": engineOutFPS, "generated": pipeline?.presentedGeneratedCount ?? 0,
-                             "sourceFPS": engineSrcFPS, "presentationStalls": pipeline?.presentationStalls ?? 0,
+                             "sourceFPS": engineSrcFPS, "captureFPSLimit": captureFPSLimit, "videoFPS": videoFrameRate,
+                             "detectedVideoFPS": pipeline?.appleCadenceStats?.detectedFPS ?? 0,
+                             "uniqueFPS": pipeline?.appleCadenceStats?.uniqueFPS ?? 0,
+                             "duplicates": pipeline?.appleCadenceStats?.duplicates ?? 0,
+                             "timelineResets": pipeline?.appleCadenceStats?.resets ?? 0, "presentationStalls": pipeline?.presentationStalls ?? 0,
                              "captureWidth": Int(pipeline?.renderSize.width ?? 0), "captureHeight": Int(pipeline?.renderSize.height ?? 0),
                              "workWidth": Int(pipeline?.appleStats?.size.width ?? 0), "workHeight": Int(pipeline?.appleStats?.size.height ?? 0),
                              "processingMS": pipeline?.appleStats?.processingMS ?? 0,
@@ -3350,7 +3448,7 @@ extension AppDelegate {
         pendingTimeout?.cancel()
         pendingSession?.stop(); pendingSession = nil
         if let _ = engineSession, multiplier == appliedMultiplier,
-           performanceMode == appliedPerformance, mode == appliedMode {
+           performanceMode == appliedPerformance, mode == appliedMode, captureFPSLimit == appliedCaptureFPSLimit, videoFrameRate == appliedVideoFrameRate {
             starting = false
             statusLabel.stringValue = "设置已生效"
             return
@@ -3376,6 +3474,8 @@ extension AppDelegate {
             return
         }
         let session = EngineSession()
+        let requestedVideoFrameRate = videoFrameRate
+        let requestedCaptureFPSLimit = captureFPSLimit
         let requestedMultiplier = multiplier
         let requestedPerformance = performanceMode
         let requestedMode = mode
@@ -3383,7 +3483,7 @@ extension AppDelegate {
                     "--multiplier", String(multiplier), "--mode", mode == .window ? "window" : "display",
                     performanceMode ? "--performance" : "--quality",
                     "--reconstruct", reconstruct.rawValue, "--reconstruct-sharp", String(sharpenAmount),
-                    "--target-fps", String(targetFPS)]
+                    "--target-fps", String(targetFPS), "--capture-fps", String(captureFPSLimit), "--video-fps", String(videoFrameRate)]
         args += ["--backend", appleBackend ? "apple" : "lsfg"]
         if offMode { args.append("--off") }
         for flag in ["--test-window", "--native-fullscreen", "--ignore-pixel-cap", "--diagnostics",
@@ -3413,6 +3513,8 @@ extension AppDelegate {
                         self.engineSession = session
                         self.pendingSession = nil
                         self.activeTarget = target
+                        self.appliedVideoFrameRate = requestedVideoFrameRate
+                        self.appliedCaptureFPSLimit = requestedCaptureFPSLimit
                         self.appliedMultiplier = requestedMultiplier
                         self.appliedPerformance = requestedPerformance
                         self.appliedMode = requestedMode
@@ -3430,7 +3532,7 @@ extension AppDelegate {
                             emitWorkerEvent(["event": "applied", "controller": getpid(), "worker": session.pid,
                                              "backend": appleBackend ? "apple" : "lsfg",
                                              "multiplier": requestedMultiplier, "performance": requestedPerformance,
-                                             "mode": requestedMode.rawValue])
+                                             "mode": requestedMode.rawValue, "captureFPSLimit": requestedCaptureFPSLimit, "videoFPS": requestedVideoFrameRate])
                         }
                         self.scheduleParentPauseTest()
                     } else if type == "error" || type == "stopped" {
@@ -3445,6 +3547,10 @@ extension AppDelegate {
                     self.remoteDropped = event["dropped"] as? Int ?? 0
                     self.remoteFPS = event["fps"] as? Double ?? 0
                     self.engineOutFPS = event["outputFPS"] as? Double ?? 0
+                    self.engineSrcFPS = event["sourceFPS"] as? Double ?? 0
+                    self.remoteDetectedVideoFPS = event["detectedVideoFPS"] as? Double ?? 0
+                    self.remoteUniqueFPS = event["uniqueFPS"] as? Double ?? 0
+                    self.remoteDuplicates = event["duplicates"] as? Int ?? 0
                     if event["pauseRevision"] as? Int == self.pauseRevision {
                         self.paused = event["paused"] as? Bool ?? self.paused
                     }
@@ -3497,6 +3603,14 @@ extension AppDelegate {
         pendingSession?.stop(); pendingSession = nil
         starting = false
         if engineSession != nil {
+            videoFrameRate = appliedVideoFrameRate
+            preferences.set(videoFrameRate, forKey: "videoFrameRate")
+            videoProfilePopup.selectItem(at: videoFPSChoices.firstIndex(of: videoFrameRate) ?? 0)
+            captureFPSPopup.isEnabled = appleBackend && videoFrameRate == 0
+            captureFPSLimit = appliedCaptureFPSLimit
+            preferences.set(captureFPSLimit, forKey: "captureFPSLimit")
+            captureFPSPopup.item(at: 0)?.title = videoFrameRate != 0 ? "60 fps" : "自动（按屏幕）"
+            captureFPSPopup.selectItem(at: videoFrameRate != 0 ? 0 : (captureFPSChoices.firstIndex(of: captureFPSLimit) ?? 0))
             multiplier = appliedMultiplier; performanceMode = appliedPerformance; mode = appliedMode
             preferences.set(multiplier, forKey: "multiplier")
             preferences.set(performanceMode, forKey: "performanceMode")
@@ -3517,6 +3631,8 @@ extension AppDelegate {
         let name = command["command"] as? String ?? ""
         if usesEngineWorker { // Explicit diagnostic control channel, never enabled in normal launches.
             switch name {
+            case "video-fps": applyVideoFrameRate(command["value"] as? Int ?? 0)
+            case "capture-fps": applyCaptureFPSLimit(command["value"] as? Int ?? 0)
             case "multiplier": applyEngineSettings(multiplier: command["value"] as? Int ?? 2)
             case "performance":
                 guard !appleBackend else { return }

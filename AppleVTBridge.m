@@ -38,9 +38,10 @@ NSError *WIAppleStart(NSObject *p, NSObject *c) {
     return [(id<WIAppleRuntime>)p startSessionWithConfiguration:c error:&e] ? nil : (e ?: WIError(@"苹果插帧会话启动失败"));
 }
 NSError *WIAppleInterpolate(NSObject *p, CVPixelBufferRef a, CMTime at, CVPixelBufferRef b, CMTime bt, CVPixelBufferRef d) {
-    return WIAppleInterpolateFrames(p, a, at, b, bt, (__bridge CFArrayRef)@[(__bridge id)d]);
+    @autoreleasepool { return WIAppleInterpolateFrames(p, a, at, b, bt, (__bridge CFArrayRef)@[(__bridge id)d]); }
 }
 NSError *WIAppleInterpolateFrames(NSObject *p, CVPixelBufferRef a, CMTime at, CVPixelBufferRef b, CMTime bt, CFArrayRef destinations) {
+    @autoreleasepool {
     Class frame = NSClassFromString(@"VTFrameProcessorFrame");
     id af = [(id<WIAppleRuntime>)[frame alloc] initWithBuffer:a presentationTimeStamp:at];
     id bf = [(id<WIAppleRuntime>)[frame alloc] initWithBuffer:b presentationTimeStamp:bt];
@@ -66,5 +67,6 @@ NSError *WIAppleInterpolateFrames(NSObject *p, CVPixelBufferRef a, CMTime at, CV
     // The owning serial queue also owns endSession, so shutdown cannot race a request.
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
     return error;
+    }
 }
 void WIAppleEnd(NSObject *p) { [(id<WIAppleRuntime>)p endSession]; }
